@@ -299,8 +299,9 @@ def diffusion_loss(net, sde, x0, min_snr=0.0):
 
 
 @torch.no_grad()
-def sample(net, sde, x_start, steps=50, rho=2.0, method="heun", amp_ctx=nullcontext):
-    """Обратный процесс от t = 1 до t_min, затем финальное расшумление x0 = (x - sigma eps) / m."""
+def sample(net, sde, x_start, steps=50, rho=2.0, method="heun", amp_ctx=nullcontext, clip=True):
+    """Обратный процесс от t = 1 до t_min, затем финальное расшумление x0 = (x - sigma eps) / m.
+    clip обрезает результат до [-1, 1], для латентов он не нужен."""
     x = x_start.clone().float()
     n, dev = x.shape[0], x.device
     u = np.linspace(1.0, 0.0, steps + 1)
@@ -336,7 +337,7 @@ def sample(net, sde, x_start, steps=50, rho=2.0, method="heun", amp_ctx=nullcont
 
     tt = torch.full((n,), float(ts[-1]), device=dev)
     x0 = (x - sde.sigma(tt).view(-1, 1, 1, 1) * eps_at(x, ts[-1])) / sde.m(tt).view(-1, 1, 1, 1)
-    return x0.clamp(-1, 1)
+    return x0.clamp(-1, 1) if clip else x0
 
 
 # ----------------------------------------------------------------------------- утилиты
