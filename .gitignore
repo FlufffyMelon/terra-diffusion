@@ -1,0 +1,22 @@
+# данные и результаты живут вне git
+/runs/
+/Terra/
+/_preview/
+/Claude outputs/
+/dataset_unique/
+/dataset_unique_crop_eval/
+/dataset_unique_labeled/*
+!/dataset_unique_labeled/boxes.json
+
+# окружение
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.serena/
+.DS_Store
+
+# веса
+*.pt
+*.pth
+*.ckpt
+slurm-*.out
