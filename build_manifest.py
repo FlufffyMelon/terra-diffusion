@@ -120,7 +120,7 @@ def frames(a, root, source, folder, drop):
             drop["модели не согласны"] += 1
             continue
         box = [min(cy[0][0], cd[0][0]), min(cy[0][1], cd[0][1]), max(cy[0][2], cd[0][2]), max(cy[0][3], cd[0][3])]
-        license_, author, stem = LICENSES.get(source), None, Path(k).stem
+        license_, author, obs, stem = LICENSES.get(source), None, None, Path(k).stem
         if source == "oi":
             hb = human.get(stem, {}).get("boxes", [])
             if len(hb) != 1:
@@ -132,7 +132,7 @@ def frames(a, root, source, folder, drop):
             if m is None or m["obs"] in dead:
                 drop["наблюдение dead или нет лицензии"] += 1
                 continue
-            license_, author = m["license"], m["attribution"]
+            license_, author, obs = m["license"], m["attribution"], m["obs"]
         if (box[2] - box[0]) * (box[3] - box[1]) < a.min_area:
             drop["кошка меньше 10% кадра"] += 1
             continue
@@ -144,7 +144,7 @@ def frames(a, root, source, folder, drop):
         group = {"popcats": parts[1] if len(parts) > 2 else None, "cati": parts[1] if len(parts) > 2 else None}.get(source)
         rel = Path(source) / (group or "") / Path(k).name
         yield dict(source=source, group=group, path=str(rel), box=[round(v, 4) for v in box], W=W, H=H, short=min(W, H), **f,
-                   license=license_, author=author), folder / k
+                   license=license_, author=author, obs=obs), folder / k
 
 
 def terra_frames(a):
