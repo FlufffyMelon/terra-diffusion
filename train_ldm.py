@@ -66,6 +66,8 @@ def parse_args():
     p.add_argument("--sample-steps", type=int, default=250)
     p.add_argument("--final-steps", type=int, default=1000, help="шагов SDE на финальной сетке")
     p.add_argument("--limit", type=int, default=0, help="для проверки: кадров из датасета")
+    p.add_argument("--init", default="", help="ckpt/last.ckpt другого запуска: взять оттуда веса модели и EMA и его scale, "
+                                             "оптимизатор, шаги и расписание LR начать заново")
     return p.parse_args()
 
 
@@ -235,6 +237,9 @@ def main():
     L.seed_everything(0, workers=True)
     torch.set_float32_matmul_precision("high")
     ds = CatLatents(a.data, a.limit)
+    if a.init:
+        # модель училась на латентах с этим масштабом, пересчитанный по другому набору кадров чуть отличается
+        ds.scale = json.loads((Path(a.init).parent.parent / "config.json").read_text())["scale"]
     print(f"кадров {len(ds)} (нет в манифесте {ds.dropped}), кропов на кадр {ds.z.shape[1]}, scale {ds.scale:.5f}", flush=True)
     loader = DataLoader(ds, batch_size=a.batch, shuffle=True, drop_last=True, num_workers=a.workers, pin_memory=True,
                         persistent_workers=a.workers > 0)
@@ -245,6 +250,10 @@ def main():
                         precision="bf16-mixed", max_steps=a.steps, gradient_clip_val=a.grad_clip, callbacks=[ckpt], logger=False,
                         enable_progress_bar=False, enable_model_summary=False)
     last = Path(a.out) / "ckpt" / "last.ckpt"
+    if a.init and not last.exists():
+        sd = torch.load(a.init, map_location="cpu", weights_only=False, mmap=True)["state_dict"]
+        module.load_state_dict(sd)
+        print(f"веса модели и EMA из {a.init}", flush=True)
     trainer.fit(module, loader, ckpt_path=str(last) if last.exists() else None)
 
 
