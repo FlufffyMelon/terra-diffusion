@@ -1,0 +1,104 @@
+#!/usr/bin/env python
+"""
+Сравнение сэмплеров и autoguidance на одних и тех же стартовых шумах. Строка = вариант, столбец = шум.
+
+Autoguidance (Karras et al. 2024): выход хорошей модели отодвигается от выхода слабой,
+  out = bad + w (good - bad),  w = 1 без направления. Слабая модель: ранний EMA-снимок того же запуска.
+
+Запуск: .venv/bin/python tools/compare_samplers.py runs/ldm_v2 [--n 8] [--seed 0]
+Результат: <run>/compare/samplers_seed<seed>.png и по картинке на вариант.
+"""
+import argparse
+import json
+import sys
+import time
+from contextlib import nullcontext
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from diffusers import AutoencoderKL
+from PIL import Image, ImageDraw, ImageFont
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from models import UNet
+from train import VPSDE, sample
+
+
+class Guided(nn.Module):
+    def __init__(self, good, bad, w):
+        super().__init__()
+        self.good, self.bad, self.w = good, bad, w
+
+    def forward(self, x, c):
+        g, b = self.good(x, c), self.bad(x, c)
+        return b + self.w * (g - b)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("run")
+    p.add_argument("--n", type=int, default=8)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--side", type=int, default=256, help="сторона картинки на общем листе")
+    a = p.parse_args()
+    run = Path(a.run)
+    cfg = json.loads((run / "config.json").read_text())
+    dev = "cuda"
+
+    def load(path):
+        ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+        sd = ck["ema"] if "ema" in ck else {k[4:]: v for k, v in ck["state_dict"].items() if k.startswith("ema.")}
+        m = UNet(img_size=64, in_ch=4, base=cfg["base"], mults=[int(v) for v in cfg["mults"].split(",")],
+                 num_res=cfg["num_res"], attn_res=[int(v) for v in cfg["attn_res"].split(",")], dropout=cfg["dropout"],
+                 norm_groups=32, head_ch=cfg.get("head_ch") or None, qk_norm=cfg.get("qk_norm", False))
+        m.load_state_dict(sd)
+        return m.to(dev).eval().requires_grad_(False)
+
+    good = load(run / "ckpt/last.ckpt")
+    weak = {s: load(run / f"ema_{s:07d}.pt") for s in (5000, 10000)}
+    vae = AutoencoderKL.from_pretrained(cfg["vae"], local_files_only=True, low_cpu_mem_usage=False).to(dev).eval()
+    sde = VPSDE(pred=cfg["pred"])
+    x0 = torch.randn(a.n, 4, 64, 64, generator=torch.Generator().manual_seed(a.seed)).to(dev)
+    bf16 = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
+
+    variants = [
+        ("heun 50, rho 2 (как в обучении)", good, "heun", 50, 2.0),
+        ("heun 50, rho 1", good, "heun", 50, 1.0),
+        ("heun 50, rho 3", good, "heun", 50, 3.0),
+        ("heun 200, rho 2", good, "heun", 200, 2.0),
+        ("sde 100", good, "sde", 100, 1.0),
+        ("sde 250", good, "sde", 250, 1.0),
+        ("sde 500", good, "sde", 500, 1.0),
+        ("sde 1000", good, "sde", 1000, 1.0),
+        ("sde 250, autoguidance 5k, w 1.5", Guided(good, weak[5000], 1.5), "sde", 250, 1.0),
+        ("sde 250, autoguidance 5k, w 2.5", Guided(good, weak[5000], 2.5), "sde", 250, 1.0),
+        ("sde 250, autoguidance 10k, w 2", Guided(good, weak[10000], 2.0), "sde", 250, 1.0),
+        ("heun 50, autoguidance 10k, w 2", Guided(good, weak[10000], 2.0), "heun", 50, 2.0),
+    ]
+    out = run / "compare"
+    out.mkdir(exist_ok=True)
+    S, L = a.side, 300
+    sheet = Image.new("RGB", (L + a.n * S, len(variants) * S), (255, 255, 255))
+    font = ImageFont.load_default(size=18)
+    for r, (name, net, method, steps, rho) in enumerate(variants):
+        t0 = time.time()
+        torch.manual_seed(a.seed)                                  # шум SDE одинаковый для всех вариантов
+        with torch.no_grad():
+            z = sample(net, sde, x0, steps=steps, rho=rho, method=method, amp_ctx=bf16, clip=False)
+            x = torch.cat([vae.decode(z[i:i + 4].float() / cfg["scale"]).sample for i in range(0, len(z), 4)])
+        x = ((x.clamp(-1, 1) + 1) * 127.5).round().byte().permute(0, 2, 3, 1).cpu().numpy()
+        row = Image.new("RGB", (a.n * 512, 512))
+        for c, im in enumerate(x):
+            row.paste(Image.fromarray(im), (c * 512, 0))
+        tag = name.split(" (")[0].replace(", ", "_").replace(" ", "")
+        row.save(out / f"{tag}_seed{a.seed}.jpg", quality=92)
+        sheet.paste(row.resize((a.n * S, S), Image.LANCZOS), (L, r * S))
+        ImageDraw.Draw(sheet).multiline_text((10, r * S + S // 2 - 30), name.replace(", ", ",\n"), fill=(0, 0, 0), font=font)
+        print(f"{name}: {time.time() - t0:.0f} с, std латента {z.std().item():.2f}", flush=True)
+    sheet.save(out / f"samplers_seed{a.seed}.jpg", quality=90)
+    print(f"готово: {out / f'samplers_seed{a.seed}.jpg'}")
+
+
+if __name__ == "__main__":
+    main()

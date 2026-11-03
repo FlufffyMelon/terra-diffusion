@@ -2,10 +2,11 @@
 """
 Чистит датасет после build_manifest.py. Кадры Терры не трогает: они проверены глазами.
 
-Сначала считает признаки каждого кадра и сохраняет в filter_features.npz, потом применяет пороги,
-поэтому пороги можно менять без пересчета (--reuse).
+Сначала считает признаки каждого кадра и сохраняет в filter_features.npz, потом применяет пороги.
+С --reuse картинки не пересчитываются: вероятности по описаниям считаются заново из сохраненных эмбеддингов CLIP,
+поэтому можно менять и пороги, и сами описания в PROMPTS.
 
-  CLIP по текстовым описаниям : рисунки, скриншоты, коллажи, игрушки, клетки, мертвые кошки, кадры без кошки
+  CLIP по текстовым описаниям : рисунки, скриншоты, коллажи, игрушки, клетки, мертвые кошки, мертвая добыча, кадры без кошки
   бокс кошки                  : размытые, слишком темные и пересвеченные
   похожесть CLIP              : дубликаты и серии почти одинаковых кадров, из них остается самый большой
   лимит на особь              : Cat Individuals, не больше --max-per-cat кадров на кошку
@@ -41,6 +42,8 @@ PROMPTS = {
     "игрушка": ["a stuffed toy cat", "a cat statue", "a cat figurine", "a cat costume mascot"],
     "клетка": ["a cat inside a metal wire cage", "a cat in an animal shelter cage", "a pink wire pet crate", "a cat behind bars"],
     "мертвая": ["a dead cat", "a dead animal on the road"],
+    "добыча": ["a cat with a dead mouse", "a dead mouse on the floor", "a dead bird", "a cat holding prey in its mouth",
+               "a cat eating a mouse", "a dead rat"],
     "нет кошки": ["a photo of a dog", "a photo of a person", "a photo of an empty room", "a photo of a plant"],
 }
 
@@ -54,6 +57,8 @@ def parse_args():
     p.add_argument("--workers", type=int, default=14)
     p.add_argument("--thr", type=float, default=0.5, help="порог вероятности причины отказа")
     p.add_argument("--thr-cage", type=float, default=0.3, help="порог для клеток: они хуже всего для фона")
+    p.add_argument("--thr-prey", type=float, default=0.3, help="порог для мертвой добычи: такие кадры недопустимы")
+    p.add_argument("--top", default="", help="причина, для которой нарисовать review/top_<причина>.jpg: самые вероятные кадры")
     p.add_argument("--min-sharp", type=float, default=25.0, help="дисперсия лапласиана бокса 224x224")
     p.add_argument("--min-bright", type=float, default=25.0)
     p.add_argument("--max-bright", type=float, default=235.0)
@@ -93,27 +98,50 @@ class Frames(Dataset):
 @torch.inference_mode()
 def compute(a, rows, root):
     model = CLIPModel.from_pretrained(CLIP, local_files_only=True).cuda().eval()
-    tok = CLIPTokenizer.from_pretrained(CLIP, local_files_only=True)
-    texts = [t for g in PROMPTS.values() for t in g]
-    owner = np.array([k for k, g in enumerate(PROMPTS.values()) for _ in g])
-    txt = model.get_text_features(**tok(texts, padding=True, return_tensors="pt").to("cuda"))
-    txt = F.normalize(getattr(txt, "pooler_output", txt), dim=-1)
-    embs, probs, sharp, bright, ok = [], [], [], [], []
+    embs, sharp, bright, ok = [], [], [], []
     loader = DataLoader(Frames(rows, root), batch_size=a.batch, num_workers=a.workers, prefetch_factor=4)
     t0, n = time.time(), 0
     for b, (x, s, br, good) in enumerate(loader):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             e = model.get_image_features(pixel_values=x.cuda(non_blocking=True))
         e = F.normalize(getattr(e, "pooler_output", e).float(), dim=-1)
-        p = (100 * e @ txt.float().T).softmax(-1).cpu().numpy()
-        probs.append(np.stack([p[:, owner == k].sum(1) for k in range(len(PROMPTS))], 1))
         embs.append(e.half().cpu().numpy())
         sharp.append(s.numpy()); bright.append(br.numpy()); ok.append(good.numpy())
         n += len(x)
         if b % 20 == 0:
             print(f"признаки: {n} из {len(rows)}, {n / (time.time() - t0):.0f} кадр/с", flush=True)
-    return dict(emb=np.concatenate(embs), probs=np.concatenate(probs), sharp=np.concatenate(sharp),
-                bright=np.concatenate(bright), ok=np.concatenate(ok))
+    return dict(emb=np.concatenate(embs), sharp=np.concatenate(sharp), bright=np.concatenate(bright), ok=np.concatenate(ok))
+
+
+@torch.inference_mode()
+def text_probs(emb):
+    """Вероятность каждой группы PROMPTS для каждого кадра по эмбеддингам CLIP: softmax по всем описаниям, сумма по группе."""
+    model = CLIPModel.from_pretrained(CLIP, local_files_only=True).cuda().eval()
+    tok = CLIPTokenizer.from_pretrained(CLIP, local_files_only=True)
+    texts = [t for g in PROMPTS.values() for t in g]
+    owner = np.array([k for k, g in enumerate(PROMPTS.values()) for _ in g])
+    txt = model.get_text_features(**tok(texts, padding=True, return_tensors="pt").to("cuda"))
+    txt = F.normalize(getattr(txt, "pooler_output", txt).float(), dim=-1)
+    out = []
+    for s in range(0, len(emb), 8192):
+        p = (100 * torch.from_numpy(emb[s:s + 8192]).float().cuda() @ txt.T).softmax(-1).cpu().numpy()
+        out.append(np.stack([p[:, owner == k].sum(1) for k in range(len(PROMPTS))], 1))
+    return np.concatenate(out)
+
+
+def top_sheet(rows, p, root, path, n=96, T=220, C=12):
+    """Кадры с наибольшей вероятностью p, подпись: вероятность и источник. Для подбора порога глазами."""
+    font = ImageFont.load_default(size=13)
+    idx = np.argsort(-p)[:n]
+    S = Image.new("RGB", (C * T, ((len(idx) + C - 1) // C) * T), (25, 25, 25))
+    for j, i in enumerate(idx):
+        try:
+            im = ImageOps.pad(ImageOps.exif_transpose(Image.open(root / rows[i]["path"])).convert("RGB"), (T - 4, T - 4), color=(25, 25, 25))
+        except Exception:
+            continue
+        ImageDraw.Draw(im).text((3, 3), f"{p[i]:.2f} {rows[i]['source']}", fill=(255, 255, 255), font=font, stroke_width=2, stroke_fill=(0, 0, 0))
+        S.paste(im, ((j % C) * T + 2, (j // C) * T + 2))
+    S.save(path, quality=85)
 
 
 def duplicates(emb, order, cos):
@@ -163,6 +191,7 @@ def main():
     else:
         z = compute(a, rows, root)
         np.savez(feat_path, **z)
+    z["probs"] = text_probs(z["emb"])
     names = list(PROMPTS)
     reasons = {}
     for i, r in enumerate(rows):
@@ -172,10 +201,13 @@ def main():
             reasons[i] = "битый файл"
             continue
         p = dict(zip(names, z["probs"][i]))
+        if p["добыча"] >= a.thr_prey:
+            reasons[i] = "добыча"
+            continue
         if p["клетка"] >= a.thr_cage:
             reasons[i] = "клетка"
             continue
-        bad = [n for n in names[1:] if n != "клетка" and p[n] >= a.thr]
+        bad = [n for n in names[1:] if n not in ("клетка", "добыча") and p[n] >= a.thr]
         if bad:
             reasons[i] = max(bad, key=lambda n: p[n])
         elif z["sharp"][i] < a.min_sharp:
@@ -184,6 +216,11 @@ def main():
             reasons[i] = "темный"
         elif z["bright"][i] > a.max_bright:
             reasons[i] = "пересвеченный"
+    # отброшен прошлым запуском фильтра (ссылки уже нет), а правила сейчас его пропускают: решение не пересматриваем,
+    # иначе пограничные кадры возвращаются без файла и без латентов
+    for i, r in enumerate(rows):
+        if i not in reasons and r["source"] != "terra" and not (root / r["path"]).exists():
+            reasons[i] = "отброшен раньше"
     left = np.array([i for i, r in enumerate(rows) if i not in reasons and r["source"] != "terra"])
     value = np.array([rows[i]["short"] + 1000 * rows[i]["fit_1x1"] for i in left])
     order = left[np.argsort(-value, kind="stable")]
@@ -210,6 +247,13 @@ def main():
     lines += ["", "Причины отказа:", ""] + [f"- {s}, {w}: {n}" for (s, w), n in sorted(rej.items())]
     print("\n".join(lines), flush=True)
     sheets(rows, reasons, root, root / "review")
+    if a.top:
+        p = z["probs"][:, names.index(a.top)].copy()
+        # Терру не трогаем, у кадров, отброшенных прошлым фильтром, ссылок уже нет
+        p[[r["source"] == "terra" or not (root / r["path"]).exists() for r in rows]] = -1
+        top_sheet(rows, p, root, root / "review" / f"top_{a.top.replace(' ', '_')}.jpg")
+        for thr in (0.1, 0.2, 0.3, 0.5):
+            print(f"{a.top}: p >= {thr}: {(p >= thr).sum()} кадров", flush=True)
     if a.dry_run:
         return
     if not full.exists():

@@ -70,14 +70,22 @@ class FrameCrops(Dataset):
 
 
 class CatLatents(Dataset):
-    """Латенты всех кадров в памяти: (кадров, кропов, 4, 64, 64). При каждом обращении случайный кроп кадра."""
+    """Латенты всех кадров в памяти: (кадров, кропов, 4, 64, 64). При каждом обращении случайный кроп кадра.
+    Берутся только кадры, которые есть в текущем manifest.jsonl: после дочистки датасета латенты не нужно пересчитывать."""
 
     def __init__(self, dataset_dir, limit=0):
         d = Path(dataset_dir) / "latents"
         shards = sorted(d.glob("shard_*.npy"))
         if not shards:
             raise SystemExit(f"нет латентов в {d}")
-        self.z = torch.from_numpy(np.concatenate([np.load(p) for p in shards]))
+        keep = {r["path"] for r in read_manifest(Path(dataset_dir) / "manifest.jsonl")}
+        z, self.dropped = [], 0
+        for p in shards:
+            names = json.loads(p.with_suffix(".json").read_text())
+            m = np.array([n in keep for n in names], dtype=bool)
+            z.append(np.load(p)[m])
+            self.dropped += int((~m).sum())
+        self.z = torch.from_numpy(np.concatenate(z))
         if limit:
             self.z = self.z[:limit]
         sample = self.z[torch.randperm(len(self.z))[:4096]].float()

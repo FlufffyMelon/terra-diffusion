@@ -61,7 +61,9 @@ def parse_args():
     p.add_argument("--raw-every", type=int, default=1000, help="сырые веса в raw/, 0 = не сохранять")
     p.add_argument("--attn-every", type=int, default=100, help="статистика внимания на 8 латентах батча")
     p.add_argument("--n-samples", type=int, default=16)
-    p.add_argument("--sample-steps", type=int, default=50)
+    p.add_argument("--sample-method", default="sde", choices=["sde", "heun"],
+                   help="сэмплер сеток по ходу обучения: Heun 50 у ldm_v2 давал размазанные картинки, SDE 250 честнее")
+    p.add_argument("--sample-steps", type=int, default=250)
     p.add_argument("--final-steps", type=int, default=1000, help="шагов SDE на финальной сетке")
     p.add_argument("--limit", type=int, default=0, help="для проверки: кадров из датасета")
     return p.parse_args()
@@ -202,10 +204,15 @@ class LDM(L.LightningModule):
             torch.save(dict(model=raw, step=s, args=vars(a), scale=self.scale), Path(a.out) / "raw" / f"raw_{s:07d}.pt")
 
     @torch.no_grad()
-    def make_samples(self, path, method="heun", steps=None, rho=2.0):
+    def make_samples(self, path, method=None, steps=None):
         t0 = time.time()
+        method = method or self.a.sample_method
         bf16 = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
-        z = sample(self.ema, self.sde, self.noise, steps=steps or self.a.sample_steps, rho=rho, method=method, amp_ctx=bf16, clip=False)
+        # шум SDE одинаковый на всех сетках; fork_rng возвращает генератор обучения в прежнее состояние
+        with torch.random.fork_rng(devices=[self.device]):
+            torch.manual_seed(1234)
+            z = sample(self.ema, self.sde, self.noise, steps=steps or self.a.sample_steps, rho=1.0 if method == "sde" else 2.0,
+                       method=method, amp_ctx=bf16, clip=False)
         with torch.autocast("cuda", enabled=False):   # Lightning держит bf16 снаружи, VAE считаем в float32
             x = torch.cat([self.vae[0].decode(z[i:i + 4].float() / self.scale).sample for i in range(0, len(z), 4)])
         save_grid(x, path, nrow=4, upscale=1)
@@ -213,7 +220,7 @@ class LDM(L.LightningModule):
 
     def on_train_end(self):
         if self.trainer.is_global_zero:
-            self.make_samples(Path(self.a.out) / "samples" / f"final_sde{self.a.final_steps}.png", method="sde", steps=self.a.final_steps, rho=1.0)
+            self.make_samples(Path(self.a.out) / "samples" / f"final_sde{self.a.final_steps}.png", method="sde", steps=self.a.final_steps)
 
 
 def lr_at(step, a):
@@ -228,7 +235,7 @@ def main():
     L.seed_everything(0, workers=True)
     torch.set_float32_matmul_precision("high")
     ds = CatLatents(a.data, a.limit)
-    print(f"кадров {len(ds)}, кропов на кадр {ds.z.shape[1]}, scale {ds.scale:.5f}", flush=True)
+    print(f"кадров {len(ds)} (нет в манифесте {ds.dropped}), кропов на кадр {ds.z.shape[1]}, scale {ds.scale:.5f}", flush=True)
     loader = DataLoader(ds, batch_size=a.batch, shuffle=True, drop_last=True, num_workers=a.workers, pin_memory=True,
                         persistent_workers=a.workers > 0)
     module = LDM(a, ds.scale)
