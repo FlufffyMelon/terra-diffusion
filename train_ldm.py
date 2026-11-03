@@ -12,6 +12,7 @@ import copy
 import csv
 import json
 import math
+import platform
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -92,6 +93,10 @@ class LDM(L.LightningModule):
         torch.manual_seed(self.a.seed * 1000 + self.global_rank + 1_000_003 * self.global_step)
 
     def on_fit_start(self):
+        # какой физический GPU у процесса: чтобы сбой CUDA можно было привязать к карте
+        pr = torch.cuda.get_device_properties(self.device)
+        print(f"процесс {self.global_rank}: {platform.node()}, GPU {self.device}, pci {getattr(pr, 'pci_bus_id', '?')}, "
+              f"uuid {getattr(pr, 'uuid', '?')}", flush=True)
         self.vae = None
         if self.trainer.is_global_zero:
             out = Path(self.a.out)
