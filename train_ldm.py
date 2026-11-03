@@ -3,7 +3,9 @@
 Латентная диффузия на Lightning, несколько GPU одного узла. Модель, расписание шума и сэмплер из train.py.
 
 Запуск: train_ldm.sbatch. Запуск с той же --out продолжается с last.ckpt.
-В --out: metrics.csv (eps-MSE как в train.py, сравним между запусками), samples/, ckpt/last.ckpt, ema_*.pt.
+В --out: metrics.csv (eps-MSE как в train.py, сравним между запусками, норма градиента до обрезки, худшее внимание),
+attn.csv (максимум логитов и энтропия каждого блока внимания), samples/, ckpt/last.ckpt, ema_*.pt,
+raw/raw_*.pt (сырые веса в bf16, чтобы разбирать срывы обучения).
 """
 import argparse
 import copy
@@ -23,6 +25,7 @@ from torch.utils.data import DataLoader
 
 from dataset import CatLatents
 from models import UNet
+from models.unet import AttnBlock
 from train import VPSDE, cosine_lr, diffusion_loss, ema_update, sample, save_grid
 
 
@@ -34,8 +37,10 @@ def parse_args():
     p.add_argument("--batch", type=int, default=64, help="на один GPU")
     p.add_argument("--workers", type=int, default=4, help="на один GPU")
     p.add_argument("--steps", type=int, default=30000)
-    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr-min", type=float, default=1e-6)
+    p.add_argument("--warmup", type=int, default=2000, help="шагов линейного прогрева LR, потом косинус")
+    p.add_argument("--seed", type=int, default=0, help="у процесса номер r сид seed * 1000 + r")
     p.add_argument("--ema", type=float, default=0.9999)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--pred", default="v", choices=["eps", "v"])
@@ -43,6 +48,8 @@ def parse_args():
     p.add_argument("--mults", default="1,2,3,4")
     p.add_argument("--num-res", type=int, default=2)
     p.add_argument("--attn-res", default="32,16,8")
+    p.add_argument("--head-ch", type=int, default=64, help="каналов на голову внимания, 0 = одна голова")
+    p.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--vae", default="stabilityai/sd-vae-ft-mse")
@@ -50,6 +57,8 @@ def parse_args():
     p.add_argument("--sample-every", type=int, default=2500)
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--snapshot-every", type=int, default=5000)
+    p.add_argument("--raw-every", type=int, default=1000, help="сырые веса в raw/, 0 = не сохранять")
+    p.add_argument("--attn-every", type=int, default=100, help="статистика внимания на 8 латентах батча")
     p.add_argument("--n-samples", type=int, default=16)
     p.add_argument("--sample-steps", type=int, default=50)
     p.add_argument("--final-steps", type=int, default=1000, help="шагов SDE на финальной сетке")
@@ -62,18 +71,25 @@ class LDM(L.LightningModule):
         super().__init__()
         self.a, self.scale = a, scale
         self.model = UNet(img_size=64, in_ch=4, base=a.base, mults=[int(v) for v in a.mults.split(",")], num_res=a.num_res,
-                          attn_res=[int(v) for v in a.attn_res.split(",")], dropout=a.dropout, norm_groups=32)
+                          attn_res=[int(v) for v in a.attn_res.split(",")], dropout=a.dropout, norm_groups=32,
+                          head_ch=a.head_ch or None, qk_norm=a.qk_norm)
         self.ema = copy.deepcopy(self.model).eval().requires_grad_(False)
         self.sde = VPSDE(pred=a.pred)
         # в списке, чтобы Lightning не считал это отдельным подмодулем с другими именами весов
         self.net = [self.model if a.no_compile else torch.compile(self.model)]
-        self.t_log, self.acc = time.time(), []
+        self.t_log, self.acc, self.gnorm = time.time(), [], []
+        self.attn_last = (float("nan"), float("nan"))
 
     def configure_optimizers(self):
         a = self.a
         opt = torch.optim.Adam(self.model.parameters(), lr=a.lr)
-        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: cosine_lr(s, a.steps, a.lr, a.lr_min) / a.lr)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_at(s, a) / a.lr)
         return dict(optimizer=opt, lr_scheduler=dict(scheduler=sched, interval="step"))
+
+    def on_train_start(self):
+        # seed_everything дал всем процессам один сид, и t, шум и dropout совпадали на всех GPU.
+        # Шаг в сиде: после продолжения с чекпоинта шум не повторяет начало обучения
+        torch.manual_seed(self.a.seed * 1000 + self.global_rank + 1_000_003 * self.global_step)
 
     def on_fit_start(self):
         self.vae = None
@@ -85,14 +101,62 @@ class LDM(L.LightningModule):
             self.log_f = open(out / "metrics.csv", "a", newline="")
             self.log_w = csv.writer(self.log_f)
             if new:
-                self.log_w.writerow(["step", "loss", "loss_t0-0.2", "loss_t0.2-0.4", "loss_t0.4-0.6", "loss_t0.6-0.8", "loss_t0.8-1", "lr", "it_per_s"])
+                self.log_w.writerow(["step", "loss", "loss_t0-0.2", "loss_t0.2-0.4", "loss_t0.4-0.6", "loss_t0.6-0.8", "loss_t0.8-1", "lr", "it_per_s",
+                                     "grad_norm", "grad_norm_max", "attn_max_logit", "attn_min_entropy"])
+            self.attn_names = [n for n, m in self.model.named_modules() if isinstance(m, AttnBlock)]
+            new = not (out / "attn.csv").exists()
+            self.attn_f = open(out / "attn.csv", "a", newline="")
+            self.attn_w = csv.writer(self.attn_f)
+            if new:
+                self.attn_w.writerow(["step"] + [f"{n}_{k}" for n in self.attn_names for k in ("max", "ent")])
+            (out / "raw").mkdir(exist_ok=True)
             self.vae = [AutoencoderKL.from_pretrained(self.a.vae, local_files_only=True, low_cpu_mem_usage=False).to(self.device).eval().requires_grad_(False)]
             self.noise = torch.randn(self.a.n_samples, 4, 64, 64, generator=torch.Generator().manual_seed(1234)).to(self.device)
 
     def training_step(self, x0, idx):
         loss, t, per = diffusion_loss(self.net[0], self.sde, x0)
+        if self.global_step == 0 and idx == 0:
+            first = self.all_gather(t[:3].detach())          # (процессов, 3): строки должны различаться
+            if self.trainer.is_global_zero:
+                print("первые t на каждом процессе:\n" + "\n".join(" ".join(f"{v:.4f}" for v in r) for r in first.view(-1, 3).tolist()), flush=True)
         self.acc.append((t.detach(), per.detach()))
         return loss
+
+    def on_before_optimizer_step(self, optimizer):
+        # градиенты уже сложены между процессами, но еще не обрезаны
+        if self.trainer.is_global_zero:
+            grads = [p.grad for p in self.model.parameters() if p.grad is not None]
+            self.gnorm.append(torch.linalg.vector_norm(torch.stack(torch._foreach_norm(grads))).detach())
+
+    @torch.no_grad()
+    def attn_stats(self, x0):
+        """Максимум логитов и средняя энтропия внимания (доля от log N) каждого блока на 8 латентах, t от 0.05 до 0.95."""
+        x0 = x0[:8].float()
+        n = len(x0)
+        t = torch.linspace(0.05, 0.95, n, device=x0.device)
+        eps = torch.randn(x0.shape, generator=torch.Generator(device=x0.device).manual_seed(0), device=x0.device)
+        xt = self.sde.m(t).view(-1, 1, 1, 1) * x0 + self.sde.sigma(t).view(-1, 1, 1, 1) * eps
+        res = {}
+
+        def hook(name):
+            def f(mod, inp, out):
+                lg = mod.logits(inp[0])
+                p = lg.softmax(-1)
+                ent = -(p * p.clamp_min(1e-12).log()).sum(-1).mean() / math.log(lg.shape[-1])
+                res[name] = (lg.max().item(), ent.item())
+            return f
+
+        mods = dict(self.model.named_modules())
+        hs = [mods[n].register_forward_hook(hook(n)) for n in self.attn_names]
+        self.model.eval()
+        try:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                self.model(xt, self.sde.c(t))
+        finally:
+            self.model.train()
+            for h in hs:
+                h.remove()
+        return [res[n] for n in self.attn_names]
 
     def on_train_batch_end(self, outputs, batch, idx):
         a, s = self.a, self.global_step
@@ -100,24 +164,37 @@ class LDM(L.LightningModule):
         if not self.trainer.is_global_zero:
             self.acc.clear()
             return
+        if a.attn_every and (s % a.attn_every == 0 or s == a.steps):
+            st = self.attn_stats(batch)
+            self.attn_w.writerow([s] + [f"{v:.4g}" for pair in st for v in pair])
+            self.attn_f.flush()
+            self.attn_last = (max(m for m, _ in st), min(e for _, e in st))
         if s % a.log_every == 0 or s == a.steps:
             t = torch.cat([v[0] for v in self.acc]); per = torch.cat([v[1] for v in self.acc])
             b = torch.bucketize(t, torch.linspace(0, 1, 6, device=t.device)[1:-1])
             bins = [per[b == i].mean().item() if (b == i).any() else float("nan") for i in range(5)]
+            g = torch.stack(self.gnorm) if self.gnorm else torch.full((1,), float("nan"))
             ips = len(self.acc) / (time.time() - self.t_log)
             lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-            self.log_w.writerow([s, f"{per.mean().item():.5f}"] + [f"{v:.5f}" for v in bins] + [f"{lr:.2e}", f"{ips:.2f}"])
+            am, ae = self.attn_last
+            self.log_w.writerow([s, f"{per.mean().item():.5f}"] + [f"{v:.5f}" for v in bins] + [f"{lr:.2e}", f"{ips:.2f}",
+                                f"{g.mean().item():.4g}", f"{g.max().item():.4g}", f"{am:.4g}", f"{ae:.4f}"])
             self.log_f.flush()
             eta = (a.steps - s) / max(ips, 1e-9) / 3600
             print(f"step {s:7d} | loss {per.mean().item():.4f} | по t: " + " ".join(f"{v:.3f}" for v in bins)
+                  + f" | grad {g.mean().item():.3f} (max {g.max().item():.3f}) | attn max {am:.1f}, ent min {ae:.2f}"
                   + f" | lr {lr:.1e} | {ips:.2f} it/s | осталось ~{eta:.1f} ч", flush=True)
             self.acc.clear()
+            self.gnorm.clear()
             self.t_log = time.time()
         if s % a.sample_every == 0 or s == a.steps:
             self.make_samples(Path(a.out) / "samples" / f"step_{s:07d}.png")
             self.t_log = time.time()
         if a.snapshot_every and s % a.snapshot_every == 0:
             torch.save(dict(ema=self.ema.state_dict(), step=s, args=vars(a), scale=self.scale), Path(a.out) / f"ema_{s:07d}.pt")
+        if a.raw_every and s % a.raw_every == 0:
+            raw = {k: v.to(torch.bfloat16) for k, v in self.model.state_dict().items()}
+            torch.save(dict(model=raw, step=s, args=vars(a), scale=self.scale), Path(a.out) / "raw" / f"raw_{s:07d}.pt")
 
     @torch.no_grad()
     def make_samples(self, path, method="heun", steps=None, rho=2.0):
@@ -132,6 +209,13 @@ class LDM(L.LightningModule):
     def on_train_end(self):
         if self.trainer.is_global_zero:
             self.make_samples(Path(self.a.out) / "samples" / f"final_sde{self.a.final_steps}.png", method="sde", steps=self.a.final_steps, rho=1.0)
+
+
+def lr_at(step, a):
+    """Линейный прогрев до a.lr за a.warmup шагов, затем косинус до a.lr_min к шагу a.steps."""
+    if step < a.warmup:
+        return a.lr * (step + 1) / a.warmup
+    return cosine_lr(step - a.warmup, a.steps - a.warmup, a.lr, a.lr_min)
 
 
 def main():

@@ -52,7 +52,7 @@ eps = torch.randn(x0.shape, generator=g).to(dev)
 def build():
     return UNet(img_size=64, in_ch=4, base=cfg["base"], mults=[int(v) for v in cfg["mults"].split(",")],
                 num_res=cfg["num_res"], attn_res=[int(v) for v in cfg["attn_res"].split(",")],
-                dropout=cfg["dropout"], norm_groups=32)
+                dropout=cfg["dropout"], norm_groups=32, head_ch=cfg.get("head_ch") or None, qk_norm=cfg.get("qk_norm", False))
 
 
 ckpts = []
@@ -71,12 +71,9 @@ stats = {}
 
 def hook(name):
     def f(mod, inp, out):
-        x = inp[0]
-        B, C, H, W = x.shape
-        qq, kk, _ = mod.qkv(mod.norm(x)).reshape(B, 3, C, H * W).unbind(1)
-        logits = torch.einsum("bci,bcj->bij", qq.float(), kk.float()) / math.sqrt(C)
+        logits = mod.logits(inp[0])
         p = logits.softmax(-1)
-        ent = -(p * p.clamp_min(1e-12).log()).sum(-1).mean().item() / math.log(H * W)
+        ent = -(p * p.clamp_min(1e-12).log()).sum(-1).mean().item() / math.log(logits.shape[-1])
         stats.setdefault(name, []).append((logits.max().item(), ent))
     return f
 

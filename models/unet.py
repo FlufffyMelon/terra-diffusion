@@ -58,32 +58,57 @@ class ResBlock(nn.Module):
 
 
 class AttnBlock(nn.Module):
-    """Одноголовое self-attention по всем точкам карты признаков."""
+    """
+    Self-attention по всем точкам карты признаков.
+      head_ch : каналов на голову, None = одна голова на все каналы, как было раньше
+      qk_norm : RMSNorm на q и k каждой головы. Без нее логиты q.k растут вместе с весами,
+                и softmax схлопывается в одну точку (так сломался ldm_v1).
+    """
 
-    def __init__(self, ch, groups=32):
+    def __init__(self, ch, groups=32, head_ch=None, qk_norm=False):
         super().__init__()
         self.norm = gn(ch, groups)
         self.qkv = nn.Conv2d(ch, 3 * ch, 1)
         self.proj = nn.Conv2d(ch, ch, 1)
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
+        self.heads = ch // head_ch if head_ch else 1
+        d = ch // self.heads
+        self.q_norm = nn.RMSNorm(d, eps=1e-6) if qk_norm else None
+        self.k_norm = nn.RMSNorm(d, eps=1e-6) if qk_norm else None
+
+    def qkv_heads(self, x):
+        """(B, C, H, W) -> q, k, v, каждый (B, heads, N, C / heads). Канал c головы h это h * d + c."""
+        B, C, H, W = x.shape
+        # contiguous: flash attention берет только тензоры с непрерывной последней осью,
+        # иначе SDPA строит полную матрицу внимания N x N на каждую голову
+        qkv = self.qkv(self.norm(x)).reshape(B, 3, self.heads, C // self.heads, H * W)
+        q, k, v = qkv.permute(1, 0, 2, 4, 3).contiguous().unbind(0)
+        if self.q_norm is not None:
+            # нормировка в float32, обратно в тип v, потому что SDPA требует один тип у q, k, v
+            q, k = self.q_norm(q.float()).to(v.dtype), self.k_norm(k.float()).to(v.dtype)
+        return q, k, v
+
+    def logits(self, x):
+        """Логиты внимания (B, heads, N, N) в float32, для диагностики."""
+        q, k, _ = self.qkv_heads(x)
+        return q.float() @ k.float().transpose(-1, -2) / math.sqrt(q.shape[-1])
 
     def forward(self, x):
         B, C, H, W = x.shape
-        q, k, v = self.qkv(self.norm(x)).reshape(B, 3, C, H * W).unbind(1)  # каждый (B, C, N)
-        q, k, v = (z.transpose(1, 2).unsqueeze(1) for z in (q, k, v))       # (B, 1, N, C)
-        h = F.scaled_dot_product_attention(q, k, v)                          # (B, 1, N, C)
-        h = h.squeeze(1).transpose(1, 2).reshape(B, C, H, W)
+        q, k, v = self.qkv_heads(x)
+        h = F.scaled_dot_product_attention(q, k, v)                          # (B, heads, N, d)
+        h = h.transpose(-1, -2).reshape(B, C, H, W)
         return x + self.proj(h)
 
 
 class Stage(nn.Module):
     """Residual-блок и, если нужно, внимание после него."""
 
-    def __init__(self, in_ch, out_ch, emb_dim, dropout, attn, groups=32):
+    def __init__(self, in_ch, out_ch, emb_dim, dropout, attn, groups=32, head_ch=None, qk_norm=False):
         super().__init__()
         self.res = ResBlock(in_ch, out_ch, emb_dim, dropout, groups)
-        self.attn = AttnBlock(out_ch, groups) if attn else nn.Identity()
+        self.attn = AttnBlock(out_ch, groups, head_ch, qk_norm) if attn else nn.Identity()
 
     def forward(self, x, emb):
         return self.attn(self.res(x, emb))
@@ -122,14 +147,18 @@ class UNet(nn.Module):
     dropout  : доля зануляемых признаков внутри res-блоков
     norm_groups : число групп в GroupNorm (не больше, чем каналов). В DDPM на CIFAR 32 группы
                на 128 каналов, по 4 канала в группе. 32 группы на 32 канала ломают средний цвет.
+    head_ch  : каналов на голову внимания, None = одна голова (старые модели)
+    qk_norm  : RMSNorm на q и k во всех блоках внимания
     """
 
     def __init__(self, img_size=64, in_ch=3, base=64, mults=(1, 2, 3, 4), num_res=2, attn_res=(16,), dropout=0.1,
-                 norm_groups=32):
+                 norm_groups=32, head_ch=None, qk_norm=False):
         super().__init__()
         self.config = dict(img_size=img_size, in_ch=in_ch, base=base, mults=tuple(mults),
-                           num_res=num_res, attn_res=tuple(attn_res), dropout=dropout, norm_groups=norm_groups)
+                           num_res=num_res, attn_res=tuple(attn_res), dropout=dropout, norm_groups=norm_groups,
+                           head_ch=head_ch, qk_norm=qk_norm)
         g = norm_groups
+        att = dict(head_ch=head_ch, qk_norm=qk_norm)
         emb_dim = 4 * base
         self.embed = NoiseEmbedding(base, emb_dim)
         self.conv_in = nn.Conv2d(in_ch, base, 3, padding=1)
@@ -141,7 +170,7 @@ class UNet(nn.Module):
         for lvl, mult in enumerate(mults):
             out = base * mult
             for _ in range(num_res):
-                self.down.append(Stage(ch, out, emb_dim, dropout, attn=res in attn_res, groups=g))
+                self.down.append(Stage(ch, out, emb_dim, dropout, attn=res in attn_res, groups=g, **att))
                 ch = out
                 skip_ch.append(ch)
             if lvl != len(mults) - 1:
@@ -150,7 +179,7 @@ class UNet(nn.Module):
                 res //= 2
 
         self.mid1 = ResBlock(ch, ch, emb_dim, dropout, g)
-        self.mid_attn = AttnBlock(ch, g)
+        self.mid_attn = AttnBlock(ch, g, **att)
         self.mid2 = ResBlock(ch, ch, emb_dim, dropout, g)
 
         # декодер: на каждом блоке приклеиваем skip с того же разрешения
@@ -158,7 +187,7 @@ class UNet(nn.Module):
         for lvl, mult in reversed(list(enumerate(mults))):
             out = base * mult
             for _ in range(num_res + 1):
-                self.up.append(Stage(ch + skip_ch.pop(), out, emb_dim, dropout, attn=res in attn_res, groups=g))
+                self.up.append(Stage(ch + skip_ch.pop(), out, emb_dim, dropout, attn=res in attn_res, groups=g, **att))
                 ch = out
             if lvl != 0:
                 self.up.append(Upsample(ch))
