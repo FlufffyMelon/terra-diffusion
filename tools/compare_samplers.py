@@ -7,6 +7,10 @@ Autoguidance (Karras et al. 2024): выход хорошей модели ото
 
 Запуск: .venv/bin/python tools/compare_samplers.py runs/ldm_v2 [--n 8] [--seed 0]
 Результат: <run>/compare/samplers_seed<seed>.png и по картинке на вариант.
+
+Свои строки вместо стандартного набора, все через SDE --steps шагов:
+  --rows "runs/ldm_v3/ckpt/last.ckpt" "runs/ldm_v3/ckpt/last.ckpt|runs/ldm_v2/ckpt/last.ckpt|1.5"
+  строка = чекпоинт или чекпоинт|слабая модель|w. Результат: <run>/compare/<--name>_seed<seed>.jpg
 """
 import argparse
 import json
@@ -18,6 +22,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from diffusers import AutoencoderKL
+from matplotlib import font_manager
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -41,12 +46,23 @@ def main():
     p.add_argument("--n", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--side", type=int, default=256, help="сторона картинки на общем листе")
+    p.add_argument("--rows", nargs="*", default=None, help="свои строки, см. описание вверху")
+    p.add_argument("--steps", type=int, default=250, help="шагов SDE для --rows")
+    p.add_argument("--name", default="rows", help="имя листа для --rows")
     a = p.parse_args()
     run = Path(a.run)
     cfg = json.loads((run / "config.json").read_text())
     dev = "cuda"
 
+    cache = {}
+
     def load(path):
+        path = str(path)
+        if path not in cache:
+            cache[path] = _load(path)
+        return cache[path]
+
+    def _load(path):
         ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
         sd = ck["ema"] if "ema" in ck else {k[4:]: v for k, v in ck["state_dict"].items() if k.startswith("ema.")}
         m = UNet(img_size=64, in_ch=4, base=cfg["base"], mults=[int(v) for v in cfg["mults"].split(",")],
@@ -55,14 +71,27 @@ def main():
         m.load_state_dict(sd)
         return m.to(dev).eval().requires_grad_(False)
 
-    good = load(run / "ckpt/last.ckpt")
-    weak = {s: load(run / f"ema_{s:07d}.pt") for s in (5000, 10000)}
     vae = AutoencoderKL.from_pretrained(cfg["vae"], local_files_only=True, low_cpu_mem_usage=False).to(dev).eval()
     sde = VPSDE(pred=cfg["pred"])
     x0 = torch.randn(a.n, 4, 64, 64, generator=torch.Generator().manual_seed(a.seed)).to(dev)
     bf16 = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
 
-    variants = [
+    if a.rows:
+        variants, sheet_name = [], f"{a.name}_seed{a.seed}"
+        for spec in a.rows:
+            parts = spec.split("|")
+            label = parts[0].replace("runs/", "").replace("/ckpt/last.ckpt", " final")
+            if len(parts) == 1:
+                variants.append((f"{label}, sde {a.steps}", load(parts[0]), "sde", a.steps, 1.0))
+            else:
+                g = parts[1].replace("runs/", "").replace("/ckpt/last.ckpt", " final").replace(".pt", "")
+                variants.append((f"{label}, ag {g}, w {parts[2]}", Guided(load(parts[0]), load(parts[1]), float(parts[2])),
+                                 "sde", a.steps, 1.0))
+    else:
+        sheet_name = f"samplers_seed{a.seed}"
+        good = load(run / "ckpt/last.ckpt")
+        weak = {s: load(run / f"ema_{s:07d}.pt") for s in (5000, 10000)}
+        variants = [
         ("heun 50, rho 2 (как в обучении)", good, "heun", 50, 2.0),
         ("heun 50, rho 1", good, "heun", 50, 1.0),
         ("heun 50, rho 3", good, "heun", 50, 3.0),
@@ -80,7 +109,7 @@ def main():
     out.mkdir(exist_ok=True)
     S, L = a.side, 300
     sheet = Image.new("RGB", (L + a.n * S, len(variants) * S), (255, 255, 255))
-    font = ImageFont.load_default(size=18)
+    font = ImageFont.truetype(font_manager.findfont("DejaVu Sans"), 18)   # шрифт PIL по умолчанию без кириллицы
     for r, (name, net, method, steps, rho) in enumerate(variants):
         t0 = time.time()
         torch.manual_seed(a.seed)                                  # шум SDE одинаковый для всех вариантов
@@ -91,13 +120,13 @@ def main():
         row = Image.new("RGB", (a.n * 512, 512))
         for c, im in enumerate(x):
             row.paste(Image.fromarray(im), (c * 512, 0))
-        tag = name.split(" (")[0].replace(", ", "_").replace(" ", "")
+        tag = name.split(" (")[0].replace(", ", "_").replace(" ", "").replace("/", "-")
         row.save(out / f"{tag}_seed{a.seed}.jpg", quality=92)
         sheet.paste(row.resize((a.n * S, S), Image.LANCZOS), (L, r * S))
         ImageDraw.Draw(sheet).multiline_text((10, r * S + S // 2 - 30), name.replace(", ", ",\n"), fill=(0, 0, 0), font=font)
         print(f"{name}: {time.time() - t0:.0f} с, std латента {z.std().item():.2f}", flush=True)
-    sheet.save(out / f"samplers_seed{a.seed}.jpg", quality=90)
-    print(f"готово: {out / f'samplers_seed{a.seed}.jpg'}")
+    sheet.save(out / f"{sheet_name}.jpg", quality=90)
+    print(f"готово: {out / f'{sheet_name}.jpg'}")
 
 
 if __name__ == "__main__":
