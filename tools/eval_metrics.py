@@ -80,8 +80,8 @@ def load_unet(path, dev):
     sd = ck["ema"] if "ema" in ck else {k[4:]: v for k, v in ck["state_dict"].items() if k.startswith("ema.")}
     m = UNet(img_size=64, in_ch=4, base=cfg["base"], mults=[int(v) for v in cfg["mults"].split(",")], num_res=cfg["num_res"],
              attn_res=[int(v) for v in cfg["attn_res"].split(",")], dropout=cfg["dropout"], norm_groups=32,
-             head_ch=cfg.get("head_ch") or None, qk_norm=cfg.get("qk_norm", False))
-    m.load_state_dict(sd)
+             head_ch=cfg.get("head_ch") or None, qk_norm=cfg.get("qk_norm", False), cond_sizes=cfg.get("cond_sizes", []))
+    m.load_state_dict(sd)   # модель с условиями без y рисует с «пустыми» условиями, как модель без условий
     step = ck.get("step", ck.get("global_step"))
     return m.to(dev).eval().requires_grad_(False), cfg, f"{run.name}-{step}"
 
