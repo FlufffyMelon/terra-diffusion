@@ -3,6 +3,7 @@
 Считает латенты для кадров из manifest.jsonl: на кадр --crops случайных кропов, бокс кошки всегда внутри.
 
 В <dataset>/latents/shard_XX.npy лежит float16 (кадров, кропов, 4, 64, 64), в shard_XX.json пути этих кадров.
+--source и --out-dir считают отдельный набор, например Терру с 64 кропами в latents_terra/.
 Коэффициент масштаба не применяется: сырые латенты, его считает CatLatents.
 Одна задача на один GPU, части делятся по --shard и --nshards. Готовая часть пропускается.
 """
@@ -30,19 +31,21 @@ def parse_args():
     p.add_argument("--vae", default="stabilityai/sd-vae-ft-mse")
     p.add_argument("--flag", default="fit_1x1")
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--source", default="", help="только кадры этого источника, например terra")
+    p.add_argument("--out-dir", default="latents", help="папка внутри датасета")
     return p.parse_args()
 
 
 def main():
     a = parse_args()
     root = Path(a.dataset)
-    out = root / "latents"
+    out = root / a.out_dir
     out.mkdir(exist_ok=True)
     path = out / f"shard_{a.shard:02d}.npy"
     if path.exists():
         print(f"{path} уже есть", flush=True)
         return
-    rows = read_manifest(root / "manifest.jsonl", a.flag)[a.shard::a.nshards]
+    rows = [r for r in read_manifest(root / "manifest.jsonl", a.flag) if not a.source or r["source"] == a.source][a.shard::a.nshards]
     rows = rows[:a.limit] if a.limit else rows
     ds = FrameCrops(rows, root, crops=a.crops, seed=a.shard)
     loader = DataLoader(ds, batch_size=a.frames, num_workers=a.workers, prefetch_factor=4)
@@ -56,7 +59,9 @@ def main():
             if not len(x):
                 continue
             n, k = x.shape[:2]
-            z = vae.encode(x.flatten(0, 1).cuda(non_blocking=True)).latent_dist.mean
+            x = x.flatten(0, 1).cuda(non_blocking=True)
+            # частями по 16: энкодер VAE на 64 картинках 512x512 не помещается в 24 ГБ
+            z = torch.cat([vae.encode(x[j:j + 16]).latent_dist.mean for j in range(0, len(x), 16)])
             res.append(z.view(n, k, *z.shape[1:]).half().cpu().numpy())
             names += [rows[i]["path"] for i in idx[ok].tolist()]
             if b % 200 == 0:

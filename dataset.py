@@ -1,8 +1,9 @@
 """
 Датасеты для латентной диффузии.
 
-FrameCrops : кадры из manifest.jsonl -> несколько случайных кропов, для подсчета латентов.
-CatLatents : готовые латенты из <dataset>/latents, для обучения.
+FrameCrops  : кадры из manifest.jsonl -> несколько случайных кропов, для подсчета латентов.
+CatLatents  : готовые латенты из <dataset>/latents, для обучения.
+CondLatents : то же с условиями «кто» (Терра или другая кошка) и «тип» (кластер DINOv2), для ldm_v4.
 
 Правило кропа то же, что в train.py: бокс кошки всегда целиком внутри, кроп не растягивает фото.
 VAE кодирует около 25 кадров/с на GPU, а U-Net принимает около 100, поэтому кодировать на лету нельзя:
@@ -97,3 +98,54 @@ class CatLatents(Dataset):
     def __getitem__(self, i):
         k = torch.randint(self.z.shape[1], (1,)).item()
         return self.z[i, k].float() * self.scale
+
+
+class CondLatents(Dataset):
+    """
+    Латенты с условиями: (латент, y), y = (кто, тип). Кто: 0 другая кошка, 1 Терра. Тип: кластер из clusters.json,
+    по признакам DINOv2 это в основном окрас и порода, а не поза или фон.
+    Другие кошки из latents/, Терра из latents_terra/ (больше кропов на кадр) без кадров terra_holdout.json.
+    Терра составляет примерно terra_frac примеров: после n_other обычных индексов идут индексы Терры,
+    каждый берет случайный кадр Терры, так что перемешивание и DistributedSampler работают как обычно.
+    """
+
+    def __init__(self, dataset_dir, terra_frac=0.1, limit=0):
+        root = Path(dataset_dir)
+        keep = {r["path"] for r in read_manifest(root / "manifest.jsonl")}
+        clusters = json.loads((root / "clusters.json").read_text())
+        self.k, assign = clusters["k"], clusters["assign"]
+        hold = set(json.loads((root / "terra_holdout.json").read_text()))
+
+        def load(sub, ok):
+            z, names, out = [], [], 0
+            for p in sorted((root / sub).glob("shard_*.npy")):
+                n = json.loads(p.with_suffix(".json").read_text())
+                m = np.array([ok(v) for v in n], dtype=bool)
+                z.append(np.load(p)[m])
+                names += [v for v, f in zip(n, m) if f]
+                out += int((~m).sum())
+            return torch.from_numpy(np.concatenate(z)), names, out
+
+        # dropped: кадры latents/, которые не берутся отсюда (нет в манифесте или это Терра, она идет из latents_terra/)
+        self.z, names, self.dropped = load("latents", lambda v: v in keep and not v.startswith("terra/"))
+        self.zt, tnames, _ = load("latents_terra", lambda v: v in keep and v not in hold)
+        if limit:
+            self.z, names = self.z[:limit], names[:limit]
+        self.scene = torch.tensor([assign[v] for v in names])
+        self.scene_t = torch.tensor([assign[v] for v in tnames])
+        self.n_other = len(self.z)
+        self.length = round(self.n_other / (1 - terra_frac))
+        sample = self.z[torch.randperm(len(self.z))[:4096]].float()
+        self.scale = 1 / sample.std().item()
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, i):
+        if i < self.n_other:
+            z, who, scene = self.z[i], 0, self.scene[i]
+        else:
+            j = torch.randint(len(self.zt), (1,)).item()
+            z, who, scene = self.zt[j], 1, self.scene_t[j]
+        k = torch.randint(z.shape[0], (1,)).item()
+        return z[k].float() * self.scale, torch.tensor([who, int(scene)])

@@ -149,18 +149,25 @@ class UNet(nn.Module):
                на 128 каналов, по 4 канала в группе. 32 группы на 32 канала ломают средний цвет.
     head_ch  : каналов на голову внимания, None = одна голова (старые модели)
     qk_norm  : RMSNorm на q и k во всех блоках внимания
+    cond_sizes : число значений каждого условия, например (2, 100): кто (другая кошка, Терра) и тип (кластер DINOv2).
+               У каждого условия своя таблица эмбеддингов с лишним значением «пусто» (номер size) для CFG.
+               Эмбеддинги складываются с эмбеддингом шума и стартуют с нуля: дообучение с весов модели
+               без условий начинается ровно с ее поведения.
     """
 
     def __init__(self, img_size=64, in_ch=3, base=64, mults=(1, 2, 3, 4), num_res=2, attn_res=(16,), dropout=0.1,
-                 norm_groups=32, head_ch=None, qk_norm=False):
+                 norm_groups=32, head_ch=None, qk_norm=False, cond_sizes=()):
         super().__init__()
         self.config = dict(img_size=img_size, in_ch=in_ch, base=base, mults=tuple(mults),
                            num_res=num_res, attn_res=tuple(attn_res), dropout=dropout, norm_groups=norm_groups,
-                           head_ch=head_ch, qk_norm=qk_norm)
+                           head_ch=head_ch, qk_norm=qk_norm, cond_sizes=tuple(cond_sizes))
         g = norm_groups
         att = dict(head_ch=head_ch, qk_norm=qk_norm)
         emb_dim = 4 * base
         self.embed = NoiseEmbedding(base, emb_dim)
+        self.cond = nn.ModuleList(nn.Embedding(n + 1, emb_dim) for n in cond_sizes)
+        for e in self.cond:
+            nn.init.zeros_(e.weight)
         self.conv_in = nn.Conv2d(in_ch, base, 3, padding=1)
 
         # энкодер: запоминаем число каналов каждого skip-соединения
@@ -198,8 +205,14 @@ class UNet(nn.Module):
         nn.init.zeros_(self.conv_out.weight)  # в начале сеть выдает 0, лосс = 1
         nn.init.zeros_(self.conv_out.bias)
 
-    def forward(self, x, c):
+    def forward(self, x, c, y=None):
+        """y : (B, число условий) long, значение size = «пусто». None = все условия пустые."""
         emb = self.embed(c)
+        if len(self.cond):
+            if y is None:
+                y = torch.tensor([e.num_embeddings - 1 for e in self.cond], device=x.device).expand(len(x), -1)
+            for k, e in enumerate(self.cond):
+                emb = emb + e(y[:, k])
         h = self.conv_in(x)
         hs = [h]
         for layer in self.down:

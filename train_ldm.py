@@ -24,7 +24,8 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.strategies import DDPStrategy
 from torch.utils.data import DataLoader
 
-from dataset import CatLatents
+from dataset import CatLatents, CondLatents
+from guidance import CFG
 from models import UNet
 from models.unet import AttnBlock
 from train import VPSDE, cosine_lr, diffusion_loss, ema_update, sample, save_grid
@@ -68,6 +69,10 @@ def parse_args():
     p.add_argument("--limit", type=int, default=0, help="для проверки: кадров из датасета")
     p.add_argument("--init", default="", help="ckpt/last.ckpt другого запуска: взять оттуда веса модели и EMA и его scale, "
                                              "оптимизатор, шаги и расписание LR начать заново")
+    p.add_argument("--cond", action="store_true", help="условия кто (Терра или другая кошка) и тип (кластер DINOv2), данные CondLatents")
+    p.add_argument("--terra-frac", type=float, default=0.1, help="доля примеров с Террой при --cond")
+    p.add_argument("--p-drop", type=float, default=0.1, help="вероятность выбросить каждое условие, нужна для CFG")
+    p.add_argument("--sample-cfg", type=float, default=2.0, help="сила CFG на сетках по ходу обучения")
     return p.parse_args()
 
 
@@ -77,7 +82,7 @@ class LDM(L.LightningModule):
         self.a, self.scale = a, scale
         self.model = UNet(img_size=64, in_ch=4, base=a.base, mults=[int(v) for v in a.mults.split(",")], num_res=a.num_res,
                           attn_res=[int(v) for v in a.attn_res.split(",")], dropout=a.dropout, norm_groups=32,
-                          head_ch=a.head_ch or None, qk_norm=a.qk_norm)
+                          head_ch=a.head_ch or None, qk_norm=a.qk_norm, cond_sizes=a.cond_sizes)
         self.ema = copy.deepcopy(self.model).eval().requires_grad_(False)
         self.sde = VPSDE(pred=a.pred)
         # в списке, чтобы Lightning не считал это отдельным подмодулем с другими именами весов
@@ -111,7 +116,7 @@ class LDM(L.LightningModule):
             self.log_w = csv.writer(self.log_f)
             if new:
                 self.log_w.writerow(["step", "loss", "loss_t0-0.2", "loss_t0.2-0.4", "loss_t0.4-0.6", "loss_t0.6-0.8", "loss_t0.8-1", "lr", "it_per_s",
-                                     "grad_norm", "grad_norm_max", "attn_max_logit", "attn_min_entropy"])
+                                     "grad_norm", "grad_norm_max", "attn_max_logit", "attn_min_entropy", "loss_terra"])
             self.attn_names = [n for n, m in self.model.named_modules() if isinstance(m, AttnBlock)]
             new = not (out / "attn.csv").exists()
             self.attn_f = open(out / "attn.csv", "a", newline="")
@@ -122,13 +127,23 @@ class LDM(L.LightningModule):
             self.vae = [AutoencoderKL.from_pretrained(self.a.vae, local_files_only=True, low_cpu_mem_usage=False).to(self.device).eval().requires_grad_(False)]
             self.noise = torch.randn(self.a.n_samples, 4, 64, 64, generator=torch.Generator().manual_seed(1234)).to(self.device)
 
-    def training_step(self, x0, idx):
-        loss, t, per = diffusion_loss(self.net[0], self.sde, x0)
+    def training_step(self, batch, idx):
+        if self.a.cond:
+            x0, y = batch
+            terra = y[:, 0] == 1
+            # каждое условие выбрасывается независимо: модель учится всем режимам, нужным для CFG
+            y = y.clone()
+            y[torch.rand(len(y), device=y.device) < self.a.p_drop, 0] = self.a.cond_sizes[0]
+            y[torch.rand(len(y), device=y.device) < self.a.p_drop, 1] = self.a.cond_sizes[1]
+            net = lambda x, c: self.net[0](x, c, y)
+        else:
+            x0, net, terra = batch, self.net[0], None
+        loss, t, per = diffusion_loss(net, self.sde, x0)
         if self.global_step == 0 and idx == 0:
             first = self.all_gather(t[:3].detach())          # (процессов, 3): строки должны различаться
             if self.trainer.is_global_zero:
                 print("первые t на каждом процессе:\n" + "\n".join(" ".join(f"{v:.4f}" for v in r) for r in first.view(-1, 3).tolist()), flush=True)
-        self.acc.append((t.detach(), per.detach()))
+        self.acc.append((t.detach(), per.detach(), None if terra is None else terra.detach()))
         return loss
 
     def on_before_optimizer_step(self, optimizer):
@@ -174,7 +189,7 @@ class LDM(L.LightningModule):
             self.acc.clear()
             return
         if a.attn_every and (s % a.attn_every == 0 or s == a.steps):
-            st = self.attn_stats(batch)
+            st = self.attn_stats(batch[0] if a.cond else batch)
             self.attn_w.writerow([s] + [f"{v:.4g}" for pair in st for v in pair])
             self.attn_f.flush()
             self.attn_last = (max(m for m, _ in st), min(e for _, e in st))
@@ -183,14 +198,18 @@ class LDM(L.LightningModule):
             b = torch.bucketize(t, torch.linspace(0, 1, 6, device=t.device)[1:-1])
             bins = [per[b == i].mean().item() if (b == i).any() else float("nan") for i in range(5)]
             g = torch.stack(self.gnorm) if self.gnorm else torch.full((1,), float("nan"))
+            # лосс на Терре: если он уходит заметно ниже общего, модель начинает запоминать ее фото
+            m = torch.cat([v[2] for v in self.acc]) if a.cond else None
+            lt = per[m].mean().item() if m is not None and m.any() else float("nan")
             ips = len(self.acc) / (time.time() - self.t_log)
             lr = self.trainer.optimizers[0].param_groups[0]["lr"]
             am, ae = self.attn_last
             self.log_w.writerow([s, f"{per.mean().item():.5f}"] + [f"{v:.5f}" for v in bins] + [f"{lr:.2e}", f"{ips:.2f}",
-                                f"{g.mean().item():.4g}", f"{g.max().item():.4g}", f"{am:.4g}", f"{ae:.4f}"])
+                                f"{g.mean().item():.4g}", f"{g.max().item():.4g}", f"{am:.4g}", f"{ae:.4f}", f"{lt:.5f}"])
             self.log_f.flush()
             eta = (a.steps - s) / max(ips, 1e-9) / 3600
             print(f"step {s:7d} | loss {per.mean().item():.4f} | по t: " + " ".join(f"{v:.3f}" for v in bins)
+                  + (f" | Терра {lt:.4f}" if a.cond else "")
                   + f" | grad {g.mean().item():.3f} (max {g.max().item():.3f}) | attn max {am:.1f}, ent min {ae:.2f}"
                   + f" | lr {lr:.1e} | {ips:.2f} it/s | осталось ~{eta:.1f} ч", flush=True)
             self.acc.clear()
@@ -211,9 +230,16 @@ class LDM(L.LightningModule):
         method = method or self.a.sample_method
         bf16 = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
         # шум SDE одинаковый на всех сетках; fork_rng возвращает генератор обучения в прежнее состояние
+        net = self.ema
+        if self.a.cond:
+            # первая половина: просто Терра, вторая: Терра и ее тип; CFG от ответа без условий
+            w, k = self.a.cond_sizes
+            n = len(self.noise)
+            y = torch.tensor([[1, k]] * (n // 2) + [[1, self.a.terra_type]] * (n - n // 2), device=self.device)
+            net = CFG(self.ema, y, torch.tensor([w, k]), self.a.sample_cfg)
         with torch.random.fork_rng(devices=[self.device]):
             torch.manual_seed(1234)
-            z = sample(self.ema, self.sde, self.noise, steps=steps or self.a.sample_steps, rho=1.0 if method == "sde" else 2.0,
+            z = sample(net, self.sde, self.noise, steps=steps or self.a.sample_steps, rho=1.0 if method == "sde" else 2.0,
                        method=method, amp_ctx=bf16, clip=False)
         with torch.autocast("cuda", enabled=False):   # Lightning держит bf16 снаружи, VAE считаем в float32
             x = torch.cat([self.vae[0].decode(z[i:i + 4].float() / self.scale).sample for i in range(0, len(z), 4)])
@@ -236,7 +262,15 @@ def main():
     a = parse_args()
     L.seed_everything(0, workers=True)
     torch.set_float32_matmul_precision("high")
-    ds = CatLatents(a.data, a.limit)
+    ds = CondLatents(a.data, a.terra_frac, a.limit) if a.cond else CatLatents(a.data, a.limit)
+    # сохраняются в config.json: по ним ноутбук и метрики собирают модель
+    a.cond_sizes = [2, ds.k] if a.cond else []
+    if a.cond:
+        # тип Терры для сеток по ходу обучения: ее самый частый кластер
+        a.terra_type = torch.bincount(ds.scene_t, minlength=ds.k).argmax().item()
+        print(f"Терра: {len(ds.zt)} кадров по {ds.zt.shape[1]} кропов, доля в примерах {a.terra_frac}, "
+              f"кластеров {ds.k}, кластеры Терры {torch.bincount(ds.scene_t, minlength=ds.k).nonzero().flatten().tolist()}, "
+              f"основной {a.terra_type}", flush=True)
     if a.init:
         # модель училась на латентах с этим масштабом, пересчитанный по другому набору кадров чуть отличается
         ds.scale = json.loads((Path(a.init).parent.parent / "config.json").read_text())["scale"]
@@ -252,8 +286,10 @@ def main():
     last = Path(a.out) / "ckpt" / "last.ckpt"
     if a.init and not last.exists():
         sd = torch.load(a.init, map_location="cpu", weights_only=False, mmap=True)["state_dict"]
-        module.load_state_dict(sd)
-        print(f"веса модели и EMA из {a.init}", flush=True)
+        res = module.load_state_dict(sd, strict=False)
+        # в модели без условий нет только эмбеддингов условий, они стартуют с нуля
+        assert not res.unexpected_keys and all(".cond." in k for k in res.missing_keys), res
+        print(f"веса модели и EMA из {a.init}, новые слои: {len(res.missing_keys)} тензоров", flush=True)
     trainer.fit(module, loader, ckpt_path=str(last) if last.exists() else None)
 
 
