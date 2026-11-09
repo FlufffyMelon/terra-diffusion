@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """
-Скачивает фото кошек для предобучения. Запуск можно прервать и повторить: готовые файлы пропускаются.
+Downloads cat photos for pretraining. The run can be interrupted and repeated: finished files are skipped.
 
-  oi   : Open Images V7, кадры с боксами класса Cat, размеченными людьми, без рисунков и групп.
-         В <root>/oi: images/ и boxes.json (координаты в долях кадра).
-  inat : iNaturalist, Felis catus с пометкой captive и лицензией CC без ND.
-         В <root>/inat: images/ и photos.jsonl (лицензия и автор каждого фото, их нужно сохранить).
+  oi   : Open Images V7, frames with human-annotated Cat boxes, without drawings and groups.
+         In <root>/oi: images/ and boxes.json (coordinates as fractions of the frame).
+  inat : iNaturalist, Felis catus marked captive with a CC license without ND.
+         In <root>/inat: images/ and photos.jsonl (license and author of each photo, they must be kept).
 
-Запуск на логин-ноде, в tmux:
+Run on the login node, in tmux:
   .venv/bin/python download_cats.py oi --workers 32
   .venv/bin/python download_cats.py inat --workers 64
 """
@@ -26,9 +26,9 @@ CAT = "/m/01yrx"
 OI_CSV = {"train": "https://storage.googleapis.com/openimages/v6/oidv6-train-annotations-bbox.csv",
           "validation": "https://storage.googleapis.com/openimages/v5/validation-annotations-bbox.csv",
           "test": "https://storage.googleapis.com/openimages/v5/test-annotations-bbox.csv"}
-INAT_API = "https://api.inaturalist.org/v2/observations"   # v2 отдает только нужные поля, ответ в 400 раз легче v1
+INAT_API = "https://api.inaturalist.org/v2/observations"   # v2 returns only the needed fields, the response is 400 times lighter than v1
 INAT_FIELDS = "id,photos.id,photos.url,photos.license_code,photos.attribution,photos.original_dimensions"
-INAT_LICENSES = "cc0,cc-by,cc-by-sa,cc-by-nc,cc-by-nc-sa"   # без ND: кропы являются производной работой
+INAT_LICENSES = "cc0,cc-by,cc-by-sa,cc-by-nc,cc-by-nc-sa"   # no ND: crops are a derivative work
 
 
 def parse_args():
@@ -36,15 +36,15 @@ def parse_args():
     p.add_argument("source", choices=["oi", "inat"])
     p.add_argument("--root", type=str, default=str(Path.home() / "DiffusionLearn_data"))
     p.add_argument("--workers", type=int, default=32)
-    p.add_argument("--limit", type=int, default=0, help="для проверки: oi = кадров, inat = страниц API")
-    # iNaturalist предупреждает о блокировке при медиа выше 5 ГБ в час или 24 ГБ в день, держимся ниже. 0 = без ограничения
-    p.add_argument("--max-gb-hour", type=float, default=4.0, help="только inat")
-    p.add_argument("--max-gb-day", type=float, default=20.0, help="только inat, сутки по UTC, счетчик переживает перезапуск")
+    p.add_argument("--limit", type=int, default=0, help="for testing: oi = frames, inat = API pages")
+    # iNaturalist warns about blocking for media above 5 GB per hour or 24 GB per day, we stay below. 0 = no limit
+    p.add_argument("--max-gb-hour", type=float, default=4.0, help="inat only")
+    p.add_argument("--max-gb-day", type=float, default=20.0, help="inat only, day in UTC, the counter survives a restart")
     return p.parse_args()
 
 
 def get(url, tries=5):
-    """Содержимое url, с повторами при сбоях сети и лимитах сервера."""
+    """Contents of url, with retries on network failures and server limits."""
     for k in range(tries):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
@@ -59,7 +59,7 @@ def get(url, tries=5):
 
 
 def fetch(job):
-    """Скачивает один файл через .tmp, чтобы оборванная загрузка не выглядела готовой. Возвращает текст ошибки или None."""
+    """Downloads one file via .tmp so that an interrupted download does not look finished. Returns the error text or None."""
     url, path = job
     if path.exists() or (path.suffix != ".jpg" and path.with_suffix(".jpg").exists()):
         return None
@@ -72,7 +72,7 @@ def fetch(job):
 
 
 def fetch_all(jobs, workers):
-    """Возвращает число скачанных и словарь ошибок."""
+    """Returns the number of downloaded files and a dict of errors."""
     done, errs = 0, {}
     with ThreadPoolExecutor(workers) as ex:
         for err in ex.map(fetch, jobs):
@@ -84,7 +84,7 @@ def fetch_all(jobs, workers):
 
 
 def oi_boxes(path):
-    """Боксы кошек из трех csv, потоком, чтобы не держать файлы на диске. Кадры с рисунками и группами отбрасываем."""
+    """Cat boxes from three csv files, streamed so that the files are not kept on disk. Frames with drawings and groups are dropped."""
     if path.exists():
         return json.loads(path.read_text())
     res = {}
@@ -98,7 +98,7 @@ def oi_boxes(path):
                     continue
                 x = dict(zip(head, line.strip().split(",")))
                 res.setdefault(x["ImageID"], dict(split=split, boxes=[]))["boxes"].append(x)
-        print(f"разметка {split}: кадров всего {len(res)}, {time.time() - t0:.0f} с", flush=True)
+        print(f"annotations {split}: frames in total {len(res)}, {time.time() - t0:.0f} s", flush=True)
     keep = {}
     for k, r in res.items():
         if any(b["IsDepiction"] != "0" or b["IsGroupOf"] != "0" for b in r["boxes"]):
@@ -107,7 +107,7 @@ def oi_boxes(path):
                                                      truncated=b["IsTruncated"] == "1", occluded=b["IsOccluded"] == "1")
                                                 for b in r["boxes"]])
     path.write_text(json.dumps(keep))
-    print(f"оставлено {len(keep)} кадров из {len(res)}", flush=True)
+    print(f"kept {len(keep)} frames of {len(res)}", flush=True)
     return keep
 
 
@@ -116,7 +116,7 @@ def download_oi(a, root):
     (d / "images").mkdir(parents=True, exist_ok=True)
     boxes = oi_boxes(d / "boxes.json")
     names = sorted(boxes)[:a.limit or None]
-    print(f"кадров к загрузке {len(names)}", flush=True)
+    print(f"frames to download {len(names)}", flush=True)
     t0, total, errs = time.time(), 0, {}
     for i in range(0, len(names), 500):
         jobs = [(f"https://open-images-dataset.s3.amazonaws.com/{boxes[k]['split']}/{k}.jpg", d / "images" / f"{k}.jpg") for k in names[i:i + 500]]
@@ -124,11 +124,11 @@ def download_oi(a, root):
         total += n
         for k, v in e.items():
             errs[k] = errs.get(k, 0) + v
-        print(f"готово {total} из {len(names)}, {total / (time.time() - t0):.1f} кадров/с, ошибки {errs}", flush=True)
+        print(f"done {total} of {len(names)}, {total / (time.time() - t0):.1f} frames/s, errors {errs}", flush=True)
 
 
 class Quota:
-    """Держит объем скачанного ниже лимитов: пауза после страницы, суточный счетчик хранится на диске."""
+    """Keeps the downloaded volume below the limits: a pause after a page, the daily counter is stored on disk."""
 
     def __init__(self, path, gb_hour, gb_day):
         self.path, self.gb_hour, self.gb_day = path, gb_hour, gb_day
@@ -155,7 +155,7 @@ class Quota:
                 time.sleep(wait)
         if self.gb_day and self.today >= self.gb_day * 2 ** 30:
             wait = 86400 - time.time() % 86400 + 60
-            print(f"суточный лимит {self.gb_day} ГБ, пауза {wait / 3600:.1f} ч до новых суток UTC", flush=True)
+            print(f"daily limit {self.gb_day} GB, pausing {wait / 3600:.1f} h until the new UTC day", flush=True)
             time.sleep(wait)
             self.t0, self.session = time.time(), 0
 
@@ -165,10 +165,10 @@ def download_inat(a, root):
     (d / "images").mkdir(parents=True, exist_ok=True)
     state = d / "photos.jsonl"
     last = 0
-    if state.exists():   # продолжаем с последнего полностью записанного наблюдения
+    if state.exists():   # continue from the last fully written observation
         for line in state.open():
             last = max(last, json.loads(line)["obs"])
-    print(f"продолжаем после наблюдения {last}", flush=True)
+    print(f"continuing after observation {last}", flush=True)
     quota = Quota(d / "usage.json", a.max_gb_hour, a.max_gb_day)
     t0, pages, photos, errs = time.time(), 0, 0, {}
     while not a.limit or pages < a.limit:
@@ -193,17 +193,17 @@ def download_inat(a, root):
         photos += n
         for k, v in e.items():
             errs[k] = errs.get(k, 0) + v
-        print(f"страница {pages}, наблюдение {last}, осталось наблюдений {j['total_results'] - len(obs)}, фото {photos}, "
-              f"сегодня {quota.today / 2 ** 30:.1f} ГБ, {photos / (time.time() - t0):.1f} фото/с, ошибки {errs}", flush=True)
+        print(f"page {pages}, observation {last}, observations left {j['total_results'] - len(obs)}, photos {photos}, "
+              f"today {quota.today / 2 ** 30:.1f} GB, {photos / (time.time() - t0):.1f} photos/s, errors {errs}", flush=True)
         quota.add(size)
-        time.sleep(1.1)   # к API не чаще запроса в секунду
+        time.sleep(1.1)   # no more than one request per second to the API
 
 
 def main():
     a = parse_args()
     root = Path(a.root)
     (download_oi if a.source == "oi" else download_inat)(a, root)
-    print("готово", flush=True)
+    print("done", flush=True)
 
 
 if __name__ == "__main__":

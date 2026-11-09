@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """
-Разбор взрыва лосса в ldm_v1: данные, веса и внимание на сохраненных чекпоинтах.
+Analysis of the loss blow-up in ldm_v1: data, weights and attention on the saved checkpoints.
 
-  данные  : NaN, inf и выбросы в латентах датасета
-  веса    : нормы q и k каждого внимания, всего блока и выходного слоя
-  внимание: максимум логитов и энтропия (в долях от log N) на реальных латентах при нескольких t
-  лосс    : eps-MSE на одном и том же батче
+  data     : NaN, inf and outliers in the dataset latents
+  weights  : norms of q and k of each attention, of the whole block and of the output layer
+  attention: max logits and entropy (as a fraction of log N) on real latents at several t
+  loss     : eps-MSE on the same batch
 
-Запуск: .venv/bin/python tools/diag_ldm.py runs/ldm_v1 ~/DiffusionLearn_data/pretrain_v1
+Launch: .venv/bin/python tools/diag_ldm.py runs/ldm_v1 ~/DiffusionLearn_data/pretrain_v1
 """
 import json
 import math
@@ -27,7 +27,7 @@ run, data = Path(sys.argv[1]), Path(sys.argv[2])
 cfg = json.loads((run / "config.json").read_text())
 dev = "cuda"
 
-# ----------------------------------------------------------------------------- данные
+# ----------------------------------------------------------------------------- data
 shards = sorted((data / "latents").glob("shard_*.npy"))
 mx, bad, n = [], 0, 0
 for p in shards:
@@ -39,8 +39,8 @@ for p in shards:
         n += len(b)
 mx = torch.cat(mx)
 q = torch.quantile(mx, torch.tensor([0.5, 0.99, 0.999, 1.0])).tolist()
-print(f"латенты: {n} кадров, с NaN или inf {bad}, max|z| по кадрам после scale: медиана {q[0]:.2f}, "
-      f"99% {q[1]:.2f}, 99.9% {q[2]:.2f}, максимум {q[3]:.2f}")
+print(f"latents: {n} frames, with NaN or inf {bad}, max|z| per frame after scale: median {q[0]:.2f}, "
+      f"99% {q[1]:.2f}, 99.9% {q[2]:.2f}, max {q[3]:.2f}")
 
 z_all = torch.from_numpy(np.concatenate([np.load(p, mmap_mode="r")[:40] for p in shards]))
 g = torch.Generator().manual_seed(0)
@@ -48,7 +48,7 @@ x0 = z_all[torch.randperm(len(z_all), generator=g)[:64], 0].float().to(dev) * cf
 eps = torch.randn(x0.shape, generator=g).to(dev)
 
 
-# ----------------------------------------------------------------------------- чекпоинты
+# ----------------------------------------------------------------------------- checkpoints
 def build():
     return UNet(img_size=64, in_ch=4, base=cfg["base"], mults=[int(v) for v in cfg["mults"].split(",")],
                 num_res=cfg["num_res"], attn_res=[int(v) for v in cfg["attn_res"].split(",")],
@@ -97,8 +97,8 @@ for label, state in ckpts:
             losses.append(((sde.to_eps(out, xt, tt) - eps) ** 2).mean().item())
     for h in hs:
         h.remove()
-    print(f"\n=== {label}: eps-MSE при t = {T}: " + " ".join(f"{v:.4f}" for v in losses))
-    print(f"{'слой':28s} {'|Wq|':>7s} {'|Wk|':>7s} {'|Wv|':>7s} {'|proj|':>7s}  " + "  ".join(f"max/ent t={t}" for t in T))
+    print(f"\n=== {label}: eps-MSE at t = {T}: " + " ".join(f"{v:.4f}" for v in losses))
+    print(f"{'layer':28s} {'|Wq|':>7s} {'|Wk|':>7s} {'|Wv|':>7s} {'|proj|':>7s}  " + "  ".join(f"max/ent t={t}" for t in T))
     for n_, m in attn:
         w = m.qkv.weight.detach().float().flatten(1)
         C = w.shape[0] // 3
@@ -106,6 +106,6 @@ for label, state in ckpts:
         row = "  ".join(f"{a:7.1f}/{e:.2f}" for a, e in stats[n_])
         print(f"{n_:28s} {wq:7.2f} {wk:7.2f} {wv:7.2f} {m.proj.weight.norm().item():7.2f}  {row}")
     big = sorted(((p.detach().float().abs().max().item(), n_) for n_, p in net.named_parameters()), reverse=True)[:4]
-    print("крупнейшие веса: " + ", ".join(f"{n_} {v:.1f}" for v, n_ in big))
+    print("largest weights: " + ", ".join(f"{n_} {v:.1f}" for v, n_ in big))
     del net
     torch.cuda.empty_cache()

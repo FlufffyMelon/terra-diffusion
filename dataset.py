@@ -1,13 +1,13 @@
 """
-Датасеты для латентной диффузии.
+Datasets for latent diffusion.
 
-FrameCrops  : кадры из manifest.jsonl -> несколько случайных кропов, для подсчета латентов.
-CatLatents  : готовые латенты из <dataset>/latents, для обучения.
-CondLatents : то же с условиями «кто» (Терра или другая кошка) и «тип» (кластер DINOv2), для ldm_v4.
+FrameCrops  : frames from manifest.jsonl -> several random crops, for computing latents.
+CatLatents  : ready latents from <dataset>/latents, for training.
+CondLatents : the same with the conditions "who" (Terra or another cat) and "type" (DINOv2 cluster), for ldm_v4.
 
-Правило кропа то же, что в train.py: бокс кошки всегда целиком внутри, кроп не растягивает фото.
-VAE кодирует около 25 кадров/с на GPU, а U-Net принимает около 100, поэтому кодировать на лету нельзя:
-на кадр заранее считается несколько кропов, и при обучении берется случайный из них.
+The crop rule is the same as in train.py: the cat box is always entirely inside, the crop does not stretch the photo.
+The VAE encodes about 25 frames/s per GPU while the U-Net consumes about 100, so encoding on the fly is not possible:
+several crops are computed per frame in advance, and training picks a random one of them.
 """
 import json
 import math
@@ -23,7 +23,7 @@ from train import crop_offsets, min_crop_side, to_unit
 
 
 def read_manifest(path, flag="fit_1x1"):
-    """Строки манифеста, годные для формата flag."""
+    """Manifest rows that fit the format flag."""
     with open(path) as f:
         rows = [json.loads(line) for line in f]
     return [r for r in rows if r[flag]]
@@ -31,8 +31,8 @@ def read_manifest(path, flag="fit_1x1"):
 
 class FrameCrops(Dataset):
     """
-    Кадр -> crops случайных квадратов size x size в [-1, 1], каждый со своим случайным отражением.
-    Возвращает (crops, 3, size, size), номер строки и ok. Битый файл дает ok = False.
+    Frame -> crops random squares size x size in [-1, 1], each with its own random flip.
+    Returns (crops, 3, size, size), the row index and ok. A broken file gives ok = False.
     """
 
     def __init__(self, rows, root, size=512, crops=4, seed=0):
@@ -47,7 +47,7 @@ class FrameCrops(Dataset):
         g = torch.Generator().manual_seed(self.seed * 1_000_003 + i)
         try:
             im = Image.open(self.root / r["path"])
-            im.draft("RGB", (2 * S, 2 * S))  # быстрое декодирование JPEG, разрешения хватает для кропа S
+            im.draft("RGB", (2 * S, 2 * S))  # fast JPEG decoding, the resolution is enough for a crop of S
             img = TF.pil_to_tensor(ImageOps.exif_transpose(im).convert("RGB"))
         except Exception:
             return torch.zeros(self.crops, 3, S, S), i, False
@@ -55,7 +55,7 @@ class FrameCrops(Dataset):
         short = min(H, W)
         b = r["box"]
         box = (max(math.floor(b[0] * W), 0), max(math.floor(b[1] * H), 0), min(math.ceil(b[2] * W), W), min(math.ceil(b[3] * H), H))
-        # в исходном фото кроп не меньше S, а фото могло декодироваться уменьшенным
+        # in the original photo the crop is at least S, and the photo may have been decoded downscaled
         lo = min_crop_side(box, H, W, min(math.ceil(S * short / r["short"]), short))
         out = []
         for _ in range(self.crops):
@@ -71,14 +71,14 @@ class FrameCrops(Dataset):
 
 
 class CatLatents(Dataset):
-    """Латенты всех кадров в памяти: (кадров, кропов, 4, 64, 64). При каждом обращении случайный кроп кадра.
-    Берутся только кадры, которые есть в текущем manifest.jsonl: после дочистки датасета латенты не нужно пересчитывать."""
+    """Latents of all frames in memory: (frames, crops, 4, 64, 64). Each access returns a random crop of the frame.
+    Only frames present in the current manifest.jsonl are used: after the dataset is cleaned further, the latents need not be recomputed."""
 
     def __init__(self, dataset_dir, limit=0):
         d = Path(dataset_dir) / "latents"
         shards = sorted(d.glob("shard_*.npy"))
         if not shards:
-            raise SystemExit(f"нет латентов в {d}")
+            raise SystemExit(f"no latents in {d}")
         keep = {r["path"] for r in read_manifest(Path(dataset_dir) / "manifest.jsonl")}
         z, self.dropped = [], 0
         for p in shards:
@@ -90,7 +90,7 @@ class CatLatents(Dataset):
         if limit:
             self.z = self.z[:limit]
         sample = self.z[torch.randperm(len(self.z))[:4096]].float()
-        self.scale = 1 / sample.std().item()   # в модель латенты идут с дисперсией 1, как и картинки в [-1, 1]
+        self.scale = 1 / sample.std().item()   # latents enter the model with variance 1, like images in [-1, 1]
 
     def __len__(self):
         return len(self.z)
@@ -102,11 +102,11 @@ class CatLatents(Dataset):
 
 class CondLatents(Dataset):
     """
-    Латенты с условиями: (латент, y), y = (кто, тип). Кто: 0 другая кошка, 1 Терра. Тип: кластер из clusters.json,
-    по признакам DINOv2 это в основном окрас и порода, а не поза или фон.
-    Другие кошки из latents/, Терра из latents_terra/ (больше кропов на кадр) без кадров terra_holdout.json.
-    Терра составляет примерно terra_frac примеров: после n_other обычных индексов идут индексы Терры,
-    каждый берет случайный кадр Терры, так что перемешивание и DistributedSampler работают как обычно.
+    Latents with conditions: (latent, y), y = (who, type). Who: 0 another cat, 1 Terra. Type: a cluster from clusters.json,
+    by DINOv2 features it is mostly coat color and breed, not pose or background.
+    Other cats from latents/, Terra from latents_terra/ (more crops per frame) without the frames in terra_holdout.json.
+    Terra makes up about terra_frac of the examples: after n_other regular indices come the Terra indices,
+    each takes a random Terra frame, so shuffling and DistributedSampler work as usual.
     """
 
     def __init__(self, dataset_dir, terra_frac=0.1, limit=0):
@@ -126,7 +126,7 @@ class CondLatents(Dataset):
                 out += int((~m).sum())
             return torch.from_numpy(np.concatenate(z)), names, out
 
-        # dropped: кадры latents/, которые не берутся отсюда (нет в манифесте или это Терра, она идет из latents_terra/)
+        # dropped: frames of latents/ that are not taken from here (not in the manifest or Terra, which comes from latents_terra/)
         self.z, names, self.dropped = load("latents", lambda v: v in keep and not v.startswith("terra/"))
         self.zt, tnames, _ = load("latents_terra", lambda v: v in keep and v not in hold)
         if limit:

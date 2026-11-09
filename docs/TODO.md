@@ -1,146 +1,146 @@
-# План: от большого датасета кошек к реалистичным фото Терры
+# Plan: from a large cat dataset to realistic photos of Terra
 
-Цель: предобучить латентную диффузию на чужих кошках на квадратных кадрах 512x512, затем поэкспериментировать
-с форматами 3:4 и 4:3, затем дообучить на фото Терры.
+Goal: pretrain a latent diffusion model on other people's cats on square 512x512 frames, then experiment
+with the 3:4 and 4:3 formats, then fine-tune on photos of Terra.
 
-Данные лежат вне проекта: `~/DiffusionLearn_data/` на кластере. Mutagen их не синхронизирует.
-Обзор источников: [research/cat_datasets.md](research/cat_datasets.md).
+The data lives outside the project: `~/DiffusionLearn_data/` on the cluster. Mutagen does not sync it.
+Overview of the sources: [research/cat_datasets.md](research/cat_datasets.md).
 
-## Принятые решения
+## Decisions made
 
-- [x] Основа: iNaturalist (captive, CC без ND) и Open Images (кадры с боксами людей), дополнения: pop-cats и Cat Individuals.
-- [x] Детекция: пара YOLO26x + RT-DETR-x. Обе нашли кошку с уверенностью >= 0.5, IoU боксов >= 0.7, итоговый бокс это объединение.
-- [x] Правило кропа: бокс кошки всегда целиком внутри кропа, кроп не требует растягивать фото.
-- [x] Кошек у края кадра оставляем, крупные планы допустимы.
-- [x] Min-SNR выключен: на данных проекта он ухудшил KID и копирование. Для латентной модели не проверялся.
-- [x] Pexels не используем: условия сайта запрещают автоматический сбор для ML.
-- [x] Проект личный, но автора и лицензию каждого фото сохраняем.
+- [x] Base: iNaturalist (captive, CC without ND) and Open Images (frames with human-annotated boxes), extras: pop-cats and Cat Individuals.
+- [x] Detection: the YOLO26x + RT-DETR-x pair. Both found a cat with confidence >= 0.5, box IoU >= 0.7, the final box is their union.
+- [x] Crop rule: the cat box is always entirely inside the crop, the crop does not require stretching the photo.
+- [x] Cats at the edge of the frame are kept, close-ups are acceptable.
+- [x] Min-SNR is off: on the project data it worsened KID and copying. Not tested for the latent model.
+- [x] Pexels is not used: the site's terms forbid automated collection for ML.
+- [x] The project is personal, but the author and license of each photo are kept.
 
-## Форматы
+## Formats
 
-| Формат | Пиксели (В x Ш) | Латент (В x Ш) | Для чего |
+| Format | Pixels (H x W) | Latent (H x W) | Purpose |
 |---|---|---|---|
-| 1:1 | 512 x 512 | 64 x 64 | предобучение |
-| 3:4 | 512 x 384 | 64 x 48 | эксперименты после предобучения |
-| 4:3 | 384 x 512 | 48 x 64 | эксперименты после предобучения |
+| 1:1 | 512 x 512 | 64 x 64 | pretraining |
+| 3:4 | 512 x 384 | 64 x 48 | experiments after pretraining |
+| 4:3 | 384 x 512 | 48 x 64 | experiments after pretraining |
 
-Стороны латента должны делиться на 8 из-за трех понижений разрешения в U-Net, поэтому 576 x 432 (латент 72 x 54) не подходит.
-Кроп проходит в формат, если `max(бокс_В, бокс_Ш * k, выход_В) <= min(В, Ш * k)`, где `k = выход_В / выход_Ш`.
+The latent sides must be divisible by 8 because of the three downsamplings in the U-Net, so 576 x 432 (latent 72 x 54) does not work.
+A crop fits a format if `max(box_H, box_W * k, out_H) <= min(H, W * k)`, where `k = out_H / out_W`.
 
-Подмножества (замер 2026-11-02, на кадрах после детекции, iNaturalist частично):
+Subsets (measured 2026-11-02, on frames after detection, iNaturalist partial):
 
-| Источник | Всего | 1:1 | 3:4 | 4:3 | Хотя бы один | Только прямоугольник | 1:1, но ни одного прямоугольника |
+| Source | Total | 1:1 | 3:4 | 4:3 | At least one | Rectangle only | 1:1 but no rectangle |
 |---|---|---|---|---|---|---|---|
-| Терра | 394 | 284 | 325 | 231 | 389 | 105 | 0 |
+| Terra | 394 | 284 | 325 | 231 | 389 | 105 | 0 |
 | pop-cats | 9 454 | 2 712 | 3 516 | 2 046 | 5 186 | 2 474 | 434 |
 | Cat Individuals | 12 207 | 7 939 | 7 310 | 8 540 | 11 894 | 3 955 | 75 |
 | Open Images | 10 622 | 5 740 | 3 775 | 7 907 | 9 266 | 3 526 | 475 |
-| iNaturalist, ~6% данных | 4 558 | 2 758 | 3 219 | 2 483 | 4 209 | 1 451 | 49 |
+| iNaturalist, ~6% of the data | 4 558 | 2 758 | 3 219 | 2 483 | 4 209 | 1 451 | 49 |
 
-Вывод: квадратные кадры почти всегда входят хотя бы в один прямоугольник, но не в оба, поэтому три признака храним отдельно.
+Conclusion: square frames almost always fit at least one rectangle, but not both, so the three flags are stored separately.
 
-## Тестовый претрейн `ldm_v1`
+## Test pretraining `ldm_v1`
 
-Проверка, какие картинки получаются в 512x512, без ухищрений: `v`, линейное расписание шума, косинусный LR, U-Net `base=192`,
-внимание на 32, 16, 8, все кадры `fit_1x1` с Террой, 7 GPU на `node211-17`, батч 64 на GPU, 26k шагов, Lightning (`train_ldm.py`).
-Латенты посчитаны заранее: VAE кодирует ~25 кадров/с, U-Net принимает ~100, поэтому 8 случайных кропов с отражением на кадр вместо кропа на лету.
+A check of what images come out at 512x512 with no tricks: `v`, linear noise schedule, cosine LR, U-Net `base=192`,
+attention at 32, 16, 8, all `fit_1x1` frames with Terra, 7 GPUs on `node211-17`, batch 64 per GPU, 26k steps, Lightning (`train_ldm.py`).
+Latents are precomputed: the VAE encodes ~25 frames/s while the U-Net consumes ~100, so 8 random crops with a flip per frame instead of a crop on the fly.
 
-Замер DDP на 7 GPU: батч 32 дает 1.14 шаг/с (255 кадров/с), батч 64 дает 0.93 шаг/с (417 кадров/с). Шаг почти не замедляется при росте батча,
-потому что ~0.5 с уходит на синхронизацию 800 МБ градиентов, поэтому батч 64 выгоднее: за то же время на 18% меньше шагов, но в 1.6 раза больше кадров.
+DDP measurement on 7 GPUs: batch 32 gives 1.14 steps/s (255 frames/s), batch 64 gives 0.93 steps/s (417 frames/s). The step barely slows down as the batch grows,
+because ~0.5 s goes to synchronizing 800 MB of gradients, so batch 64 is more efficient: in the same time 18% fewer steps but 1.6 times more frames.
 
-Итог `ldm_v1`: на шаге 5 400 лосс подскочил с 0.176 до 0.27 и вернулся только к шагу ~16 800, когда LR упал ниже ~6e-5.
-Причина, по `tools/diag_ldm.py`: схлопывание внимания. Одна голова на 384-768 каналов без нормировки q и k, логиты до 18 000,
-энтропия 0.01 от log N на 16x16 уже к шагу 5 000. EMA 5 000 и сырые веса 23 000 дают одинаковый лосс, то есть 18 тыс. шагов впустую.
-Еще все процессы DDP шли с одним сидом, и t, шум и dropout совпадали на всех GPU.
+Outcome of `ldm_v1`: at step 5 400 the loss jumped from 0.176 to 0.27 and returned only around step 16 800, when LR dropped below ~6e-5.
+The cause, according to `tools/diag_ldm.py`: attention collapse. A single head over 384-768 channels without normalization of q and k, logits up to 18 000,
+entropy 0.01 of log N at 16x16 already by step 5 000. EMA 5 000 and raw weights 23 000 give the same loss, i.e. 18k steps were wasted.
+Also, all DDP processes ran with the same seed, and t, noise and dropout were identical on all GPUs.
 
-## Претрейн `ldm_v2`
+## Pretraining `ldm_v2`
 
-То же, что `ldm_v1`, плюс исправления: головы по 64 канала, RMSNorm на q и k, прогрев LR 2 000 шагов до 1e-4, свой сид у каждого процесса.
-В `metrics.csv` норма градиента до обрезки и худший блок внимания, в `attn.csv` каждый блок, сырые веса каждые 1 000 шагов в `raw/`.
-6 GPU на `node211-17`, батч 64 на GPU, 26k шагов.
+The same as `ldm_v1`, plus fixes: heads of 64 channels, RMSNorm on q and k, LR warmup of 2 000 steps up to 1e-4, a separate seed per process.
+`metrics.csv` has the gradient norm before clipping and the worst attention block, `attn.csv` every block, raw weights every 1 000 steps in `raw/`.
+6 GPUs on `node211-17`, batch 64 per GPU, 26k steps.
 
-## 1. Сбор данных
+## 1. Data collection
 
-- [x] Скачать Open Images: 12 839 кадров.
-- [x] Скачать и распаковать pop-cats и Cat Individuals.
-- [x] Докачать iNaturalist (`download_cats.py inat`, в `tmux`): 80 387 фото.
-- [x] Прогнать iNaturalist обоими детекторами: обработано 80 293, 94 фото детекторы не взяли и они не вошли в датасет.
+- [x] Download Open Images: 12 839 frames.
+- [x] Download and unpack pop-cats and Cat Individuals.
+- [x] Finish downloading iNaturalist (`download_cats.py inat`, in `tmux`): 80 387 photos.
+- [x] Run iNaturalist through both detectors: 80 293 processed, 94 photos were not accepted by the detectors and did not enter the dataset.
 
-Итог `pretrain_v1`: 76 048 кадров после детекции, 58 673 после `filter_frames.py`, из них 39 259 в 1:1
-(iNaturalist 31 017, Open Images 4 308, pop-cats 2 315, Cat Individuals 1 335, Терра 284).
+Outcome of `pretrain_v1`: 76 048 frames after detection, 58 673 after `filter_frames.py`, of which 39 259 in 1:1
+(iNaturalist 31 017, Open Images 4 308, pop-cats 2 315, Cat Individuals 1 335, Terra 284).
 
-## 2. Манифест и фильтр
+## 2. Manifest and filter
 
-Один файл `manifest.jsonl`, одна строка на кадр: источник, путь, размеры, итоговый бокс, `fit_1x1`, `fit_3x4`, `fit_4x3`, лицензия, автор.
+A single file `manifest.jsonl`, one line per frame: source, path, sizes, final box, `fit_1x1`, `fit_3x4`, `fit_4x3`, license, author.
 
-- [ ] Написать `build_manifest.py`: собрать детекции и применить условия согласия и площади бокса >= 0.1.
-- [ ] Open Images: использовать боксы людей, детекторы только для проверки.
-- [ ] Посчитать `fit_*` для трех форматов.
-- [ ] Убрать кадры с несколькими кошками: сейчас среди прошедших их 2-16%.
-- [ ] iNaturalist: исключить наблюдения с пометкой dead (345 штук, `term_id=17`, `term_value_id=19`).
-- [ ] Убрать чёрно-белые фото.
-- [ ] Cat Individuals: ограничить число кадров на особь и отфильтровать розовые клетки, иначе модель выучит этот фон.
-- [ ] Убрать дубликаты и почти дубликаты (перцептивный хэш).
-- [ ] Просмотреть выборки глазами по каждому источнику и по отброшенным кадрам.
-- [ ] Проверить, снижает ли расширение бокса на несколько процентов долю порезанных кошек. Сейчас она около 12% на боксах Open Images.
-- [ ] Рассмотреть CLIP-фильтр против рисунков, скриншотов, игрушек и коллажей, если они найдутся при просмотре.
+- [ ] Write `build_manifest.py`: gather the detections and apply the agreement conditions and box area >= 0.1.
+- [ ] Open Images: use the human boxes, detectors only for checking.
+- [ ] Compute `fit_*` for the three formats.
+- [ ] Remove frames with several cats: currently 2-16% of those that passed.
+- [ ] iNaturalist: exclude observations marked dead (345 of them, `term_id=17`, `term_value_id=19`).
+- [ ] Remove black-and-white photos.
+- [ ] Cat Individuals: limit the number of frames per individual and filter out pink cages, otherwise the model will learn this background.
+- [ ] Remove duplicates and near-duplicates (perceptual hash).
+- [ ] Review samples by eye for each source and for the rejected frames.
+- [ ] Check whether expanding the box by a few percent reduces the share of cut-off cats. Currently it is about 12% on Open Images boxes.
+- [ ] Consider a CLIP filter against drawings, screenshots, toys and collages, if they turn up in review.
 
-## 3. Латентный пайплайн
+## 3. Latent pipeline
 
-- [ ] Посчитать коэффициент VAE на итоговом наборе. На фото Терры он 0.231, а не стандартные 0.18215.
-- [ ] Написать подсчёт и кэш латентов. Кропы случайные, поэтому заранее считать набор кропов на кадр или кодировать на лету.
-- [ ] Пресет модели: `in_ch=4`, `base=128`, внимание на 32, 16, 8.
-- [ ] Адаптировать `memorization.py`: декодировать латенты, считать KID и `ratio<0.7` в пикселях.
-- [ ] Метрика обрезанных кошек и поз: детектор по сэмплам, доля боксов у края и вытянутых боксов. KID этого не видит.
+- [ ] Compute the VAE scale factor on the final set. On Terra photos it is 0.231, not the standard 0.18215.
+- [ ] Write the latent computation and cache. The crops are random, so either precompute a set of crops per frame or encode on the fly.
+- [ ] Model preset: `in_ch=4`, `base=128`, attention at 32, 16, 8.
+- [ ] Adapt `memorization.py`: decode the latents, compute KID and `ratio<0.7` in pixels.
+- [ ] A metric for cut-off cats and poses: run a detector on the samples, the share of boxes at the edge and of elongated boxes. KID does not see this.
 
-## 4. Предобучение на 512x512
+## 4. Pretraining at 512x512
 
-- [ ] Выбрать вариант: `eps` или `v` без Min-SNR. На 64 px лучший баланс дал `eps`, `v` копировал меньше, но картинки были мягче. Сравнить коротким прогоном.
-- [ ] Обучить на кадрах `fit_1x1`.
+- [ ] Choose a variant: `eps` or `v` without Min-SNR. At 64 px `eps` gave the best balance, `v` copied less but the images were softer. Compare with a short run.
+- [ ] Train on `fit_1x1` frames.
 
-Замер скорости U-Net на латенте 64x64x4 (RTX 4500 Ada, bf16, torch.compile, синтетические данные, внимание на 32, 16, 8, батч 64):
+U-Net speed measurement on a 64x64x4 latent (RTX 4500 Ada, bf16, torch.compile, synthetic data, attention at 32, 16, 8, batch 64):
 
-| base | Параметры | Шаг/с | Память | 300k шагов |
+| base | Parameters | Steps/s | Memory | 300k steps |
 |---|---|---|---|---|
-| 128 | 90M | 2.78 | 8.1 ГБ | 30 ч |
-| 192 | 201M | 1.63 | 12.6 ГБ | 51 ч |
-| 256 | 358M | 1.11 | 17.8 ГБ | 75 ч |
+| 128 | 90M | 2.78 | 8.1 GB | 30 h |
+| 192 | 201M | 1.63 | 12.6 GB | 51 h |
+| 256 | 358M | 1.11 | 17.8 GB | 75 h |
 
-- [ ] Базовый вариант: `base=192`, батч 64, 300k шагов, это ~19 млн кадров и ~60 GPU-часов с запасом на сэмплы и загрузку данных.
-- [ ] Добавить в `train.py` DDP: на 4 GPU ждем примерно 15-17 часов вместо 60, GPU-часов столько же или чуть больше.
-- [ ] VAE: кандидат `stabilityai/sdxl-vae` (PSNR на 0.4-0.7 дБ выше `sd-vae-ft-mse`), сравнить реконструкции глазами. Коэффициент пересчитать на итоговом наборе.
-- [ ] Если копирование будет высоким, добавить уличных кошек iNaturalist (~80 тыс. наблюдений).
-- [ ] Оценить KID, копирование, сэмплы.
+- [ ] Baseline variant: `base=192`, batch 64, 300k steps, which is ~19 million frames and ~60 GPU-hours with a margin for samples and data loading.
+- [ ] Add DDP to `train.py`: on 4 GPUs we expect about 15-17 hours instead of 60, with the same or slightly more GPU-hours.
+- [ ] VAE: candidate `stabilityai/sdxl-vae` (PSNR 0.4-0.7 dB higher than `sd-vae-ft-mse`), compare reconstructions by eye. Recompute the scale factor on the final set.
+- [ ] If copying is high, add outdoor iNaturalist cats (~80 thousand observations).
+- [ ] Evaluate KID, copying, samples.
 
-Анатомия:
+Anatomy:
 
-- [ ] Метка кластера: кластеризовать признаки DINOv2 и учить с classifier-free guidance (Self-Guided Diffusion). Выбор числа кластеров до старта обучения.
-- [ ] Autoguidance: направлять модель ранним чекпоинтом или уменьшенной версией, ничего не дообучая.
-- [ ] Заменить Inception на DINOv2 в метриках качества.
-- [ ] Проверить `v` на композицию: на 64 px он убрал явный брак.
-- [ ] Отбор готовых сэмплов детектором или дискриминатором.
-- [ ] Эталон: LoRA на SDXL, чтобы видеть предел своей модели.
+- [ ] Cluster label: cluster the DINOv2 features and train with classifier-free guidance (Self-Guided Diffusion). Choose the number of clusters before training starts.
+- [ ] Autoguidance: guide the model with an early checkpoint or a smaller version, with no extra training.
+- [ ] Replace Inception with DINOv2 in the quality metrics.
+- [ ] Check `v` for composition: at 64 px it removed obvious defects.
+- [ ] Select finished samples with a detector or discriminator.
+- [ ] Reference: LoRA on SDXL, to see the limit of our own model.
 
-## 5. Эксперименты с 3:4 и 4:3
+## 5. Experiments with 3:4 and 4:3
 
-U-Net сверточный, без позиционных эмбеддингов, а внимание не зависит от размера карты, поэтому веса квадратной модели
-загружаются без изменений. Ожидаем, что хватит короткого дообучения, но это не проверено.
+The U-Net is convolutional, has no positional embeddings, and attention does not depend on the map size, so the weights of the square model
+load without changes. We expect a short fine-tune to be enough, but this has not been verified.
 
-- [ ] Проверить генерацию квадратной моделью в 64 x 48 и 48 x 64 без дообучения.
-- [ ] Дообучить на кадрах `fit_3x4` и `fit_4x3`, батч из одного формата.
-- [ ] Вернуть прямоугольные кадры в `train.py` (`--buckets`): работа начата и отложена, код удален.
-- [ ] Сравнить долю вытянутых поз с квадратной моделью.
+- [ ] Check generation with the square model at 64 x 48 and 48 x 64 without fine-tuning.
+- [ ] Fine-tune on `fit_3x4` and `fit_4x3` frames, with each batch from a single format.
+- [ ] Bring rectangular frames back into `train.py` (`--buckets`): the work was started and postponed, the code was removed.
+- [ ] Compare the share of elongated poses with the square model.
 
-## 6. Дообучение на Терре
+## 6. Fine-tuning on Terra
 
-- [ ] Метка класса `кошка / Терра`, 10% батчей без метки для classifier-free guidance, фото Терры подавать чаще.
-- [ ] Короткий файнтюн с малым LR.
-- [ ] В прямоугольниках Терре доступно 389 кадров из 394 вместо 284 в квадрате: это возвращает длинные позы.
-- [ ] Метрики на отложенных 30 фото Терры.
+- [ ] Class label `cat / Terra`, 10% of batches without a label for classifier-free guidance, feed Terra photos more often.
+- [ ] A short fine-tune with a small LR.
+- [ ] In rectangles 389 of 394 frames are available for Terra instead of 284 in the square: this brings back the elongated poses.
+- [ ] Metrics on the held-out 30 Terra photos.
 
-## Идеи на потом
+## Ideas for later
 
-- Доснять Терру: 30-50 кадров вытянутых поз, горизонтально, с запасом вокруг кошки.
-- Чаще подавать кадры с вытянутыми боксами.
-- Поворот на +-10-15 градусов для снимков сверху.
-- LoRA на SDXL как эталон качества.
+- Shoot more of Terra: 30-50 frames of elongated poses, landscape orientation, with room around the cat.
+- Feed frames with elongated boxes more often.
+- Rotation by +-10-15 degrees for shots from above.
+- LoRA on SDXL as a quality reference.

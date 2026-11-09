@@ -1,19 +1,19 @@
 #!/usr/bin/env python
 """
-Собирает датасет для претрейна из скачанных источников и детекций.
+Builds the pretraining dataset from the downloaded sources and detections.
 
-В <root>/<name>:
-  manifest.jsonl : одна строка на кадр: source, group, path, box (доли кадра), W, H, short,
+In <root>/<name>:
+  manifest.jsonl : one line per frame: source, group, path, box (fractions of the frame), W, H, short,
                    fit_1x1, fit_3x4, fit_4x3, license, author.
-  terra/, inat/, oi/          : ссылки на фото,
-  popcats/<порода>/           : деление источника сохранено,
-  cati/<номер кошки>/         : то же.
-  README.md                   : сколько кадров прошло и почему отброшены остальные.
+  terra/, inat/, oi/          : links to the photos,
+  popcats/<breed>/           : the source's split is kept,
+  cati/<cat id>/         : same.
+  README.md                   : how many frames passed and why the rest were dropped.
 
-Условия: обе модели нашли кошку с уверенностью >= --score и боксы совпали с IoU >= --iou, итоговый бокс это объединение.
-Open Images: бокс размечен человеком, кадр с одной кошкой. Площадь бокса >= --min-area, кошка одна, снимок цветной.
-iNaturalist: наблюдения с пометкой dead отброшены. Терра берется целиком, боксы проверены глазами.
-Кадр попадает в манифест, если годится хотя бы для одного формата, кроп не растягивает фото.
+Conditions: both models found a cat with confidence >= --score and the boxes match with IoU >= --iou, the final box is their union.
+Open Images: the box is human-annotated, one cat in the frame. Box area >= --min-area, a single cat, a color photo.
+iNaturalist: observations marked dead are dropped. Terra is taken whole, its boxes were checked by eye.
+A frame enters the manifest if it fits at least one format, i.e. the crop does not stretch the photo.
 """
 import argparse
 import json
@@ -26,8 +26,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-FORMATS = {"fit_1x1": (512, 512), "fit_3x4": (512, 384), "fit_4x3": (384, 512)}   # высота и ширина выхода
-LICENSES = {"oi": "CC BY 2.0", "cati": "CC BY 4.0", "popcats": "не указана"}
+FORMATS = {"fit_1x1": (512, 512), "fit_3x4": (512, 384), "fit_4x3": (384, 512)}   # output height and width
+LICENSES = {"oi": "CC BY 2.0", "cati": "CC BY 4.0", "popcats": "not specified"}
 
 
 def parse_args():
@@ -39,7 +39,7 @@ def parse_args():
     p.add_argument("--iou", type=float, default=0.7)
     p.add_argument("--min-area", type=float, default=0.1)
     p.add_argument("--workers", type=int, default=14)
-    p.add_argument("--limit", type=int, default=0, help="для проверки: кадров на источник")
+    p.add_argument("--limit", type=int, default=0, help="for testing: frames per source")
     return p.parse_args()
 
 
@@ -49,7 +49,7 @@ def load(root, model, source):
         for line in f:
             try:
                 r = json.loads(line)
-            except json.JSONDecodeError:   # задачу могли остановить посреди записи последней строки
+            except json.JSONDecodeError:   # the job may have been stopped in the middle of writing the last line
                 continue
             res[r["f"]] = r
     return res
@@ -63,7 +63,7 @@ def iou(a, b):
 
 
 def cats(rec, score):
-    """Боксы кошек выше порога по убыванию уверенности, почти совпадающие боксы считаем одной кошкой."""
+    """Cat boxes above the threshold in descending order of confidence; nearly identical boxes count as one cat."""
     out = []
     for b in sorted((b for b in rec["b"] if b[0] >= score), key=lambda b: -b[0]):
         if all(iou(b[1:], c) < 0.5 for c in out):
@@ -72,7 +72,7 @@ def cats(rec, score):
 
 
 def fits(box, W, H):
-    """Для каждого формата: помещается ли бокс в кроп этого формата без растягивания фото."""
+    """For each format: whether the box fits into the crop of that format without stretching the photo."""
     bw, bh = (box[2] - box[0]) * W, (box[3] - box[1]) * H
     res = {}
     for name, (oh, ow) in FORMATS.items():
@@ -82,7 +82,7 @@ def fits(box, W, H):
 
 
 def is_gray(path):
-    """Чёрно-белый снимок: каналы почти не отличаются на уменьшенной копии."""
+    """Black-and-white image: the channels barely differ on a downscaled copy."""
     try:
         im = Image.open(path)
         im.draft("RGB", (128, 128))
@@ -93,7 +93,7 @@ def is_gray(path):
 
 
 def frames(a, root, source, folder, drop):
-    """Кадры источника, прошедшие детекцию, с причинами отказа в счетчике drop."""
+    """Source frames that passed detection, with rejection reasons counted in drop."""
     Y, D = load(root, "yolo26x", source), load(root, "rtdetr-x", source)
     human = json.loads((root / "oi/boxes.json").read_text()) if source == "oi" else {}
     meta = {}
@@ -107,38 +107,38 @@ def frames(a, root, source, folder, drop):
         y, d = Y[k], D[k]
         W, H = y["W"], y["H"]
         if W == 0:
-            drop["битый файл"] += 1
+            drop["broken file"] += 1
             continue
         cy, cd = cats(y, a.score), cats(d, a.score)
         if not cy or not cd:
-            drop["кошка не найдена обеими моделями"] += 1
+            drop["cat not found by both models"] += 1
             continue
         if len(cy) > 1 or len(cd) > 1:
-            drop["несколько кошек"] += 1
+            drop["multiple cats"] += 1
             continue
         if iou(cy[0], cd[0]) < a.iou:
-            drop["модели не согласны"] += 1
+            drop["models disagree"] += 1
             continue
         box = [min(cy[0][0], cd[0][0]), min(cy[0][1], cd[0][1]), max(cy[0][2], cd[0][2]), max(cy[0][3], cd[0][3])]
         license_, author, obs, stem = LICENSES.get(source), None, None, Path(k).stem
         if source == "oi":
             hb = human.get(stem, {}).get("boxes", [])
             if len(hb) != 1:
-                drop["несколько кошек"] += 1
+                drop["multiple cats"] += 1
                 continue
             box = [hb[0]["x1"], hb[0]["y1"], hb[0]["x2"], hb[0]["y2"]]
         if source == "inat":
             m = meta.get(stem)
             if m is None or m["obs"] in dead:
-                drop["наблюдение dead или нет лицензии"] += 1
+                drop["dead observation or no license"] += 1
                 continue
             license_, author, obs = m["license"], m["attribution"], m["obs"]
         if (box[2] - box[0]) * (box[3] - box[1]) < a.min_area:
-            drop["кошка меньше 10% кадра"] += 1
+            drop["cat smaller than 10% of frame"] += 1
             continue
         f = fits(box, W, H)
         if not any(f.values()):
-            drop["не годится ни в один формат"] += 1
+            drop["fits no format"] += 1
             continue
         parts = Path(k).parts
         group = {"popcats": parts[1] if len(parts) > 2 else None, "cati": parts[1] if len(parts) > 2 else None}.get(source)
@@ -156,7 +156,7 @@ def terra_frames(a):
         f = fits(box, W, H)
         if any(f.values()):
             yield dict(source="terra", group=None, path=f"terra/{n}", box=box, W=W, H=H, short=min(W, H), **f,
-                       license="личные фото", author=None), src / n
+                       license="personal photos", author=None), src / n
 
 
 def main():
@@ -165,7 +165,7 @@ def main():
     root = Path(a.root)
     out = root / a.name
     if out.exists():
-        shutil.rmtree(out)    # внутри только манифест, отчет и ссылки
+        shutil.rmtree(out)    # inside there are only the manifest, the report and links
     out.mkdir(parents=True)
     drop = Counter()
     items = list(terra_frames(a))
@@ -176,13 +176,13 @@ def main():
         got = list(frames(a, root, s, folder, d))
         report[s] = d
         items += got
-        print(f"{s}: прошло детекцию {len(got)}, отброшено {sum(d.values())}: {dict(d)}, {time.time() - t0:.0f} с", flush=True)
+        print(f"{s}: passed detection {len(got)}, dropped {sum(d.values())}: {dict(d)}, {time.time() - t0:.0f} s", flush=True)
     with Pool(a.workers) as pool:
         gray = pool.map(is_gray, [p for r, p in items], chunksize=64)
     keep = []
     for (r, p), g in zip(items, gray):
         if g and r["source"] != "terra":
-            report[r["source"]]["чёрно-белый или не читается"] += 1
+            report[r["source"]]["grayscale or unreadable"] += 1
         else:
             keep.append((r, p))
     with open(out / "manifest.jsonl", "w") as f:
@@ -191,15 +191,15 @@ def main():
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.symlink_to(p)
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    lines = [f"# {a.name}", "", "| Источник | Всего | 1:1 | 3:4 | 4:3 |", "|---|---|---|---|---|"]
+    lines = [f"# {a.name}", "", "| Source | Total | 1:1 | 3:4 | 4:3 |", "|---|---|---|---|---|"]
     for s in ["terra", *sources, None]:
         rows = [r for r, _ in keep if s is None or r["source"] == s]
-        lines.append(f"| {s or 'итого'} | {len(rows)} | {sum(r['fit_1x1'] for r in rows)} | {sum(r['fit_3x4'] for r in rows)} | {sum(r['fit_4x3'] for r in rows)} |")
-    lines += ["", "Отброшено:", ""]
+        lines.append(f"| {s or 'total'} | {len(rows)} | {sum(r['fit_1x1'] for r in rows)} | {sum(r['fit_3x4'] for r in rows)} | {sum(r['fit_4x3'] for r in rows)} |")
+    lines += ["", "Dropped:", ""]
     lines += [f"- {s}: {dict(d)}" for s, d in report.items()]
     (out / "README.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines), flush=True)
-    print(f"готово за {time.time() - t0:.0f} с: {out}", flush=True)
+    print(f"done in {time.time() - t0:.0f} s: {out}", flush=True)
 
 
 if __name__ == "__main__":

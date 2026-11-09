@@ -1,23 +1,23 @@
 #!/usr/bin/env python
 """
-Насколько модель с условиями рисует Терру: похожесть, новизна, разнообразие. Все на признаках DINOv2 (как в prepare_cond.py).
+How well the conditional model draws Terra: similarity, novelty, diversity. All on DINOv2 features (as in prepare_cond.py).
 
-  похожесть  : логистическая регрессия «Терра / другая кошка» на обучающих кадрах Терры и случайных других кошках.
-               Ее точность на отложенных кадрах terra_holdout.json печатается как проверка. Метрика: доля сэмплов,
-               которые она считает Террой (p > 0.5).
-  копии      : как в memorization.py, но для 512 px. Каждое обучающее фото Терры раскладывается на кропы по правилу
-               обучения (бокс внутри, несколько размеров и сдвигов, отражение) в 64x64. Для сэмпла d1 = расстояние
-               до ближайшего фото, d2 = до второго ближайшего другого фото, ratio = d1 / d2. Копия близка к одному фото
-               намного сильнее, чем к остальным: ratio < 0.7. Калибровка: то же у отложенных настоящих фото.
-               Близость DINOv2 к ближайшему фото тоже печатается, но копии она не ловит: все фото Терры для нее
-               и так похожи (медиана 0.93), а явная копия может иметь 0.93.
-  разнообразие и реализм : KID и FD между сэмплами и всеми кадрами Терры, признаки DINOv2. FD при малом N смещен,
-               сравнивать только варианты с одинаковым N.
+  similarity: logistic regression "Terra / another cat" on the Terra training frames and random other cats.
+               Its accuracy on the held-out frames of terra_holdout.json is printed as a check. Metric: the fraction of samples
+               it considers Terra (p > 0.5).
+  copies    : as in memorization.py, but for 512 px. Each Terra training photo is expanded into crops by the training
+               rule (box inside, several sizes and shifts, flip) at 64x64. For a sample d1 = distance
+               to the nearest photo, d2 = to the second nearest different photo, ratio = d1 / d2. A copy is close to one photo
+               much more than to the others: ratio < 0.7. Calibration: the same for the held-out real photos.
+               DINOv2 proximity to the nearest photo is also printed, but it does not catch copies: all Terra photos are
+               similar to each other for it anyway (median 0.93), and an obvious copy may have 0.93.
+  diversity and realism : KID and FD between samples and all Terra frames, DINOv2 features. FD is biased at small N,
+               compare only variants with the same N.
 
-Варианты: строки вида "w=3" или "w=3,type=terra" или "w=3,ag=runs/ldm_v4/ema_0005000.pt@2".
-  w     : сила CFG по условиям от ответа без условий
-  type  : none (по умолчанию, тип «пусто»), terra (основной кластер Терры) или номер кластера
-  ag    : autoguidance слабой моделью с теми же условиями, путь@w
+Variants: lines like "w=3" or "w=3,type=terra" or "w=3,ag=runs/ldm_v4/ema_0005000.pt@2".
+  w     : CFG strength over the conditions relative to the response without conditions
+  type  : none (default, type "empty"), terra (the main Terra cluster) or a cluster index
+  ag    : autoguidance with a weak model with the same conditions, path@w
 .venv/bin/python tools/eval_terra.py --ckpt runs/ldm_v4/ema_0020000.pt --dataset ~/DiffusionLearn_data/pretrain_v1 \\
     --out runs/eval/terra_v4 --rows w=1 w=2 w=3 "w=3,type=terra"
 """
@@ -51,11 +51,11 @@ DINO = "facebook/dinov2-large"
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", required=True, help="ckpt/last.ckpt или ema_*.pt модели с условиями")
+    p.add_argument("--ckpt", required=True, help="ckpt/last.ckpt or ema_*.pt of a model with conditions")
     p.add_argument("--dataset", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--rows", nargs="+", required=True)
-    p.add_argument("--n", type=int, default=512, help="сэмплов на вариант")
+    p.add_argument("--n", type=int, default=512, help="samples per variant")
     p.add_argument("--steps", type=int, default=250)
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--seed", type=int, default=0)
@@ -76,7 +76,7 @@ def load_unet(path, dev):
 
 
 def load_photos(root, rows, short=256):
-    """Фото с уменьшенной короткой стороной и бокс кошки в пикселях: (3, H, W) uint8 и (x1, y1, x2, y2)."""
+    """Photo with the short side reduced and the cat box in pixels: (3, H, W) uint8 and (x1, y1, x2, y2)."""
     imgs, boxes = [], []
     for r in rows:
         im = ImageOps.exif_transpose(Image.open(root / r["path"])).convert("RGB")
@@ -90,14 +90,14 @@ def load_photos(root, rows, short=256):
 
 
 def copy_refs(root, train_rows, size=64, npos=5, nsides=5):
-    """Кропы обучающих фото Терры по правилу обучения: (M, 3*size*size) на GPU и номер фото у каждого кропа."""
+    """Crops of the Terra training photos by the training rule: (M, 3*size*size) on the GPU and the photo index of each crop."""
     imgs, boxes = load_photos(root, train_rows)
     refs, owner = build_refs(imgs, size, None, npos, boxes=boxes, nsides=nsides)
     return refs.flatten(1).cuda(), owner.cuda()
 
 
 def random_crops(root, rows, size=64, seed=0):
-    """По одному случайному кропу на фото по правилу обучения, в [-1, 1]: калибровка на отложенных фото."""
+    """One random crop per photo by the training rule, in [-1, 1]: calibration on the held-out photos."""
     g = torch.Generator().manual_seed(seed)
     out = []
     for img, box in zip(*load_photos(root, rows)):
@@ -110,15 +110,15 @@ def random_crops(root, rows, size=64, seed=0):
 
 
 def copy_ratio(img, refs, owner, n_img, size=64):
-    """img : (B, 3, S, S) в [-1, 1] -> ratio = d1 / d2 и номер ближайшего фото."""
+    """img : (B, 3, S, S) in [-1, 1] -> ratio = d1 / d2 and the index of the nearest photo."""
     q = F.interpolate(img.float(), size=(size, size), mode="bilinear", align_corners=False, antialias=True)
     d1, d2, nn_img, _ = nearest(q.flatten(1).cuda(), refs, owner, n_img)
     return d1 / d2, nn_img
 
 
 def logreg(x, y, iters=500, wd=1e-4):
-    """Логистическая регрессия (L-BFGS) на стандартизованных признаках, классы взвешены по размеру:
-    иначе 254 кадра Терры против 8000 других тонут, и модель всегда отвечает «не Терра». x : (N, d), y : (N,) из 0 и 1."""
+    """Logistic regression (L-BFGS) on standardized features, classes weighted by size:
+    otherwise 254 Terra frames against 8000 others get drowned out, and the model always answers "not Terra". x : (N, d), y : (N,) of 0 and 1."""
     mu, sd = x.mean(0), x.std(0) + 1e-6
     xs = (x - mu) / sd
     w = torch.zeros(x.shape[1], device=x.device, requires_grad=True)
@@ -155,21 +155,21 @@ def main():
     tr_other, ho_other = others[:8000], others[8000:10000]
 
     clf = logreg(torch.cat([tr_terra, tr_other]), torch.cat([torch.ones(len(tr_terra)), torch.zeros(len(tr_other))]).to(dev))
-    print(f"классификатор: отложенная Терра узнана {(clf(ho_terra) > 0.5).float().mean():.0%}, "
-          f"другие кошки приняты за Терру {(clf(ho_other) > 0.5).float().mean():.1%}", flush=True)
+    print(f"classifier: held-out Terra recognized {(clf(ho_terra) > 0.5).float().mean():.0%}, "
+          f"other cats taken for Terra {(clf(ho_other) > 0.5).float().mean():.1%}", flush=True)
     nn_hold = (ho_terra @ tr_terra.T).max(1).values
     all_terra = color[is_terra].double().cpu()
 
-    # копии: кропы обучающих фото Терры в пикселях, калибровка на отложенных
+    # copies: crops of the Terra training photos in pixels, calibration on the held-out ones
     train_rows = [rows[p] for p in sorted(rows) if rows[p]["source"] == "terra" and p not in hold]
     hold_rows = [rows[p] for p in sorted(hold)]
     refs, owner = copy_refs(root, train_rows)
     r_hold, _ = copy_ratio(random_crops(root, hold_rows), refs, owner, len(train_rows))
-    print(f"копии: {len(refs)} кропов {len(train_rows)} обучающих фото; у отложенных ratio < 0.7: {(r_hold < 0.7).float().mean():.1%}, "
-          f"медиана ratio {r_hold.median():.3f}", flush=True)
+    print(f"copies: {len(refs)} crops of {len(train_rows)} training photos; held-out ratio < 0.7: {(r_hold < 0.7).float().mean():.1%}, "
+          f"median ratio {r_hold.median():.3f}", flush=True)
 
     def dino_feats(img):
-        """Картинки (B, 3, S, S) в [-1, 1] -> нормированные признаки DINOv2, тем же путем, что у сэмплов."""
+        """Images (B, 3, S, S) in [-1, 1] -> normalized DINOv2 features, via the same path as for samples."""
         x = F.interpolate((img + 1) / 2, size=(224, 224), mode="bicubic", align_corners=False, antialias=True).clamp(0, 1)
         with bf16():
             return F.normalize(dino(pixel_values=(x - mean) / std).pooler_output.float(), dim=-1)
@@ -185,20 +185,20 @@ def main():
     bf16 = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
     weak = {}
 
-    # проверка пути признаков: отложенные фото Терры в 512 через dino_feats должны быть так же близки к обучающим,
-    # как их признаки из dino_feats.npz (там кроп сразу в 224)
+    # feature path check: held-out Terra photos at 512 through dino_feats should be as close to the training ones
+    # as their features from dino_feats.npz (there the crop goes straight to 224)
     hrows = [rows[p] for p in sorted(hold)]
     with torch.no_grad():
         x = torch.stack([FrameCrops(hrows, root, size=512, crops=1, seed=0)[i][0][0] for i in range(len(hrows))]).to(dev)
         check = (dino_feats(x) @ tr_terra.T).max(1).values.median().item()
-    print(f"проверка пути признаков: у отложенных в 512 близость {check:.3f} (из dino_feats.npz {nn_hold.median():.3f})", flush=True)
+    print(f"feature path check: held-out at 512 proximity {check:.3f} (from dino_feats.npz {nn_hold.median():.3f})", flush=True)
 
     f = open(out / "metrics.csv", "a", newline="")
     wr = csv.writer(f)
     if f.tell() == 0:
-        wr.writerow(["модель", "вариант", "n", "похожа_на_терру", "копии_ratio<0.7", "ratio_медиана", "близость_dinov2_медиана",
-                     "kid_dinov2_x1000", "fd_dinov2", "секунд"])
-    wr.writerow(["", "отложенные кадры Терры", len(ho_terra), f"{(clf(ho_terra) > 0.5).float().mean():.3f}",
+        wr.writerow(["model", "variant", "n", "terra_like", "copies_ratio<0.7", "ratio_median", "dinov2_proximity_median",
+                     "kid_dinov2_x1000", "fd_dinov2", "seconds"])
+    wr.writerow(["", "held-out Terra frames", len(ho_terra), f"{(clf(ho_terra) > 0.5).float().mean():.3f}",
                  f"{(r_hold < 0.7).float().mean():.3f}", f"{r_hold.median():.3f}", f"{nn_hold.median():.3f}", "", "", ""])
     f.flush()
 
@@ -237,8 +237,8 @@ def main():
              f"{nn_gen.median():.3f}", f"{kd * 1e3:.2f}", f"{fd(all_terra, e.double().cpu()):.1f}", f"{time.time() - t0:.0f}"]
         wr.writerow(r)
         f.flush()
-        print(f"{name} {spec}: похожа на Терру {r[3]}, копии {r[4]} (ratio {r[5]}), близость DINOv2 {r[6]}, KID-DINOv2 x1000 {r[7]}, "
-              f"FD {r[8]}, {r[9]} с", flush=True)
+        print(f"{name} {spec}: looks like Terra {r[3]}, copies {r[4]} (ratio {r[5]}), DINOv2 proximity {r[6]}, KID-DINOv2 x1000 {r[7]}, "
+              f"FD {r[8]}, {r[9]} s", flush=True)
 
 
 if __name__ == "__main__":

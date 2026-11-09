@@ -1,23 +1,23 @@
 #!/usr/bin/env python
 """
-Качество латентной диффузии: FD-DINOv2 и KID между сэмплами и настоящими кадрами.
+Latent diffusion quality: FD-DINOv2 and KID between samples and real frames.
 
-  FD-DINOv2 : расстояние Фреше между гауссианами признаков DINOv2 ViT-L/14 (CLS после LayerNorm, вход 224),
-              как в Stein et al. 2023. Чувствителен к общему сдвигу и разбросу, но смещен при малом N:
-              сравнивать можно только при одинаковом числе сэмплов.
-  KID       : несмещенная оценка MMD^2 с полиномиальным ядром на признаках Inception-v3 (как в memorization.py),
-              работает и на тысяче сэмплов, дает разброс по подвыборкам.
-  Бесплатно : FID на Inception и KID на DINOv2, признаки все равно посчитаны.
+  FD-DINOv2 : Frechet distance between Gaussians of DINOv2 ViT-L/14 features (CLS after LayerNorm, input 224),
+              as in Stein et al. 2023. Sensitive to overall shift and spread, but biased at small N:
+              compare only at the same number of samples.
+  KID       : unbiased estimate of MMD^2 with a polynomial kernel on Inception-v3 features (as in memorization.py),
+              works with a thousand samples too, gives the spread over subsets.
+  For free  : FID on Inception and KID on DINOv2, the features are computed anyway.
 
-Эталон: --n-real кадров fit_1x1 из манифеста, по одному кропу с тем же правилом, что при обучении (бокс внутри).
-Две опорные строки, чтобы понимать шкалу:
-  настоящие      : другие --n-gen настоящих кадров. Нижняя граница метрик при таком N.
-  реконструкция  : те же кадры через VAE. Лучшее, что можно получить с этим VAE.
+Reference: --n-real fit_1x1 frames from the manifest, one crop each with the same rule as in training (box inside).
+Two anchor rows to understand the scale:
+  real            : other --n-gen real frames. The lower bound of the metrics at this N.
+  reconstruction  : the same frames through the VAE. The best one can get with this VAE.
 
-Строки: чекпоинт или чекпоинт|слабая модель|w (autoguidance), все через SDE --steps шагов.
+Rows: a checkpoint or checkpoint|weak model|w (autoguidance), all via SDE with --steps steps.
   .venv/bin/python tools/eval_metrics.py --dataset ~/DiffusionLearn_data/pretrain_v1 --out runs/eval/v2_v3 \\
       --rows runs/ldm_v3/ckpt/last.ckpt "runs/ldm_v3/ckpt/last.ckpt|runs/ldm_v2/ckpt/last.ckpt|2"
-В --out: metrics.csv (строка на вариант, дописывается по мере готовности), feats/*.npz, grids/*.jpg.
+In --out: metrics.csv (one row per variant, appended as they finish), feats/*.npz, grids/*.jpg.
 """
 import argparse
 import csv
@@ -55,7 +55,7 @@ def parse_args():
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--no-baselines", action="store_true", help="без строк «настоящие» и «реконструкция»")
+    p.add_argument("--no-baselines", action="store_true", help='without the "real" and "VAE reconstruction" rows')
     return p.parse_args()
 
 
@@ -72,7 +72,7 @@ class Guided(torch.nn.Module):
 
 
 def load_unet(path, dev):
-    """EMA-веса из ckpt/last.ckpt или ema_*.pt; конфигурация из config.json того же запуска."""
+    """EMA weights from ckpt/last.ckpt or ema_*.pt; configuration from config.json of the same run."""
     path = Path(path)
     run = path.parent.parent if path.parent.name == "ckpt" else path.parent
     cfg = json.loads((run / "config.json").read_text())
@@ -81,13 +81,13 @@ def load_unet(path, dev):
     m = UNet(img_size=64, in_ch=4, base=cfg["base"], mults=[int(v) for v in cfg["mults"].split(",")], num_res=cfg["num_res"],
              attn_res=[int(v) for v in cfg["attn_res"].split(",")], dropout=cfg["dropout"], norm_groups=32,
              head_ch=cfg.get("head_ch") or None, qk_norm=cfg.get("qk_norm", False), cond_sizes=cfg.get("cond_sizes", []))
-    m.load_state_dict(sd)   # модель с условиями без y рисует с «пустыми» условиями, как модель без условий
+    m.load_state_dict(sd)   # a model with conditions drawn without y uses "empty" conditions, like a model without conditions
     step = ck.get("step", ck.get("global_step"))
     return m.to(dev).eval().requires_grad_(False), cfg, f"{run.name}-{step}"
 
 
 class Features:
-    """DINOv2 и Inception для картинок (B, 3, S, S) в [-1, 1] на GPU."""
+    """DINOv2 and Inception for images (B, 3, S, S) in [-1, 1] on the GPU."""
 
     def __init__(self, dev):
         self.dino = AutoModel.from_pretrained(DINO, local_files_only=True).to(dev).eval()
@@ -104,11 +104,11 @@ class Features:
 
 
 def fd(a, b):
-    """Расстояние Фреше между гауссианами двух наборов признаков (N, d)."""
+    """Frechet distance between Gaussians of two feature sets (N, d)."""
     a, b = a.numpy(), b.numpy()
     mu1, mu2 = a.mean(0), b.mean(0)
     s1, s2 = np.cov(a, rowvar=False), np.cov(b, rowvar=False)
-    # tr sqrt(S1 S2) = tr sqrt(sqrt(S1) S2 sqrt(S1)): вторая матрица симметричная, ее корень через eigvalsh устойчив
+    # tr sqrt(S1 S2) = tr sqrt(sqrt(S1) S2 sqrt(S1)): the second matrix is symmetric, its root via eigvalsh is stable
     e, v = linalg.eigh(s1)
     r1 = (v * np.sqrt(np.clip(e, 0, None))) @ v.T
     tr_covmean = np.sqrt(np.clip(linalg.eigvalsh(r1 @ s2 @ r1), 0, None)).sum()
@@ -133,7 +133,7 @@ def main():
     feat = Features(dev)
     t_start = time.time()
 
-    # ------------------------------------------------------------- эталон
+    # ------------------------------------------------------------- reference
     ref_path = out / "feats" / "real.npz"
     if ref_path.exists():
         z = np.load(ref_path)
@@ -145,15 +145,15 @@ def main():
             fd_.append(d); fi_.append(i)
         ref_d, ref_i = torch.cat(fd_), torch.cat(fi_)
         np.savez(ref_path, dino=ref_d.numpy(), inc=ref_i.numpy())
-    print(f"эталон: {len(ref_d)} кадров, {time.time() - t_start:.0f} с", flush=True)
+    print(f"reference: {len(ref_d)} frames, {time.time() - t_start:.0f} s", flush=True)
 
     csv_path = out / "metrics.csv"
     new = not csv_path.exists()
     f = open(csv_path, "a", newline="")
     w = csv.writer(f)
     if new:
-        w.writerow(["вариант", "n", "fd_dinov2", "kid_inception_x1000", "kid_inception_std_x1000", "fid_inception",
-                    "kid_dinov2_x1000", "секунд", "картинок_в_секунду"])
+        w.writerow(["variant", "n", "fd_dinov2", "kid_inception_x1000", "kid_inception_std_x1000", "fid_inception",
+                    "kid_dinov2_x1000", "seconds", "images_per_second"])
 
     def report(name, d, i, sec):
         k, ks = kid(ref_i, i)
@@ -162,27 +162,27 @@ def main():
              f"{sec:.0f}", f"{len(d) / max(sec, 1e-9):.2f}"]
         w.writerow(r)
         f.flush()
-        print(f"{name}: FD-DINOv2 {r[2]} | KID x1000 {r[3]} ± {r[4]} | FID {r[5]} | KID-DINOv2 x1000 {r[6]} | {r[7]} с", flush=True)
+        print(f"{name}: FD-DINOv2 {r[2]} | KID x1000 {r[3]} ± {r[4]} | FID {r[5]} | KID-DINOv2 x1000 {r[6]} | {r[7]} s", flush=True)
 
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", local_files_only=True, low_cpu_mem_usage=False).to(dev).eval()
 
-    # ------------------------------------------------------------- опорные строки
+    # ------------------------------------------------------------- anchor rows
     if not a.no_baselines:
         t0 = time.time()
-        acc = {"настоящие": ([], []), "реконструкция VAE": ([], [])}
+        acc = {"real": ([], []), "VAE reconstruction": ([], [])}
         for x, _, ok in real_loader(rows, root, base_idx, a):
             x = x[ok, 0].to(dev)
             with torch.no_grad():
-                # частями по 16: энкодер VAE на 64 картинках 512x512 не помещается в 24 ГБ
+                # in chunks of 16: the VAE encoder does not fit 64 images of 512x512 into 24 GB
                 rec = torch.cat([vae.decode(vae.encode(x[j:j + 16]).latent_dist.mean).sample for j in range(0, len(x), 16)])
-            for key, img in (("настоящие", x), ("реконструкция VAE", rec)):
+            for key, img in (("real", x), ("VAE reconstruction", rec)):
                 d, i = feat(img)
                 acc[key][0].append(d); acc[key][1].append(i)
         sec = time.time() - t0
         for key, (d, i) in acc.items():
             report(key, torch.cat(d), torch.cat(i), sec)
 
-    # ------------------------------------------------------------- варианты
+    # ------------------------------------------------------------- variants
     bf16 = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
     for spec in a.rows:
         parts = spec.split("|")
@@ -196,7 +196,7 @@ def main():
         fd_, fi_ = [], []
         for b in range(0, a.n_gen, a.batch):
             n = min(a.batch, a.n_gen - b)
-            s = a.seed * 1_000_003 + b                                  # у всех вариантов одни и те же шумы
+            s = a.seed * 1_000_003 + b                                  # the same noises for all variants
             x0 = torch.randn(n, 4, 64, 64, generator=torch.Generator().manual_seed(s)).to(dev)
             torch.manual_seed(s)
             with torch.no_grad():
@@ -208,13 +208,13 @@ def main():
             fd_.append(d); fi_.append(i)
             if b // a.batch % 10 == 0:
                 done = b + n
-                print(f"  {name}: {done} из {a.n_gen}, {done / (time.time() - t0):.2f} картинок/с", flush=True)
+                print(f"  {name}: {done} of {a.n_gen}, {done / (time.time() - t0):.2f} images/s", flush=True)
         d, i = torch.cat(fd_), torch.cat(fi_)
         np.savez(out / "feats" / f"{name.replace(', ', '_').replace(' ', '')}.npz", dino=d.numpy(), inc=i.numpy())
         report(name, d, i, time.time() - t0)
         del net, good
         torch.cuda.empty_cache()
-    print(f"готово за {(time.time() - t_start) / 3600:.1f} ч", flush=True)
+    print(f"done in {(time.time() - t_start) / 3600:.1f} h", flush=True)
 
 
 if __name__ == "__main__":

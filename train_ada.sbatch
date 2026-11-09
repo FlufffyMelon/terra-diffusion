@@ -7,22 +7,22 @@
 #SBATCH --mem=64G
 #SBATCH -t 08:00:00
 #SBATCH -J ddpm_cat_ada
-#SBATCH --output=/home/CCP/semenchuk.aa/DiffusionLearn/runs/slurm_%j.log
+#SBATCH --output=runs/slurm_%j.log
 
-# Обучение диффузионной модели на фото кошки (64x64, VP-SDE, U-Net).
-# Запуск:              sbatch train.sbatch
-# Другое имя и модель:  RUN=cat64_small sbatch train_ada.sbatch --model unet_small
-# Любые аргументы после имени скрипта уходят в train.py.
-# Если упрется в лимит времени, просто запусти еще раз с тем же RUN: продолжит с last.pt.
+# Training a diffusion model on cat photos (64x64, VP-SDE, U-Net).
+# Launch:              sbatch train.sbatch
+# Another name and model:  RUN=cat64_small sbatch train_ada.sbatch --model unet_small
+# Any arguments after the script name go to train.py.
+# If it hits the time limit, just launch it again with the same RUN: it continues from last.pt.
 
-PROJECTDIR=/home/CCP/semenchuk.aa/DiffusionLearn
+PROJECTDIR="$SLURM_SUBMIT_DIR"   # submit from the project root
 VENV=${VENV:-${PROJECTDIR}/.venv}
 RUN=${RUN:-cat64}
 OUTDIR=${PROJECTDIR}/runs/${RUN}
 
 mkdir -p "$OUTDIR"
 source "${VENV}/bin/activate"
-export OMP_NUM_THREADS=1   # параллелим загрузку данных воркерами DataLoader, а не потоками внутри них
+export OMP_NUM_THREADS=1   # parallelize data loading with DataLoader workers, not with threads inside them
 
 echo "=== DDPM cat $(date) | job $SLURM_JOB_ID | node $(hostname) | run $RUN ==="
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv

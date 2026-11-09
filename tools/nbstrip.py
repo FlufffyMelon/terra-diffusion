@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Git-фильтр: убирает выводы из ноутбука при коммите, рабочий файл не меняется. Только стандартная библиотека."""
+"""Git filter: strips outputs from the notebook on commit, the working file is not changed. Standard library only."""
 import json
 import sys
 

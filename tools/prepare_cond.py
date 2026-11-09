@@ -1,19 +1,19 @@
 #!/usr/bin/env python
 """
-Условия для ldm_v4: отложенные фото Терры и кластеры по признакам DINOv2.
-Кластеры получаются в основном по окрасу и породе (рыжие, смокинги, колорпойнт), а не по позе или фону,
-поэтому в обучении это условие «тип кошки». Терра попадает в кластер длинношерстных колорпойнтов.
+Conditions for ldm_v4: held-out Terra photos and clusters by DINOv2 features.
+The clusters come out mostly by coat color and breed (ginger, tuxedo, colorpoint), not by pose or background,
+so in training this is the "cat type" condition. Terra falls into the cluster of long-haired colorpoints.
 
-  terra_holdout.json : --holdout кадров Терры fit_1x1, которые не идут в обучение, на них проверяем похожесть и новизну.
-  clusters.json      : номер кластера у каждого кадра fit_1x1, k-means по признакам DINOv2 ViT-L/14 (CLS, 224).
-  dino_feats.npz     : сами признаки, цветные и черно-белые, для метрик и пересчета кластеров.
-  review/clusters_*.jpg : по --per-sheet кластеров на лист, строка = кластер, случайные кадры из него.
+  terra_holdout.json : --holdout Terra fit_1x1 frames that are not used in training, used to check similarity and novelty.
+  clusters.json      : cluster index of each fit_1x1 frame, k-means on DINOv2 ViT-L/14 features (CLS, 224).
+  dino_feats.npz     : the features themselves, color and black-and-white, for metrics and for recomputing clusters.
+  review/clusters_*.jpg : --per-sheet clusters per sheet, row = cluster, random frames from it.
 
-Кластер сцены не должен означать Терру: тогда условие «Терра» спорило бы с условием «сцена».
-Если считать k-means по всем кадрам, DINOv2 собирает почти все фото Терры в 1-3 своих кластера.
-Поэтому центры считаются только по другим кошкам, а кадры Терры относятся к ближайшему центру.
-Кластеры считаются по цветным и по черно-белым картинкам, берется вариант, где кадры Терры
-разбросаны по кластерам сильнее (меньше доля самого частого кластера Терры).
+A scene cluster must not mean Terra: otherwise the "Terra" condition would conflict with the "scene" condition.
+If k-means is run on all frames, DINOv2 gathers almost all Terra photos into 1-3 clusters of their own.
+So the centers are computed only from the other cats, and Terra frames are assigned to the nearest center.
+Clusters are computed on color and on black-and-white images, the variant is taken where the Terra frames
+are more spread over clusters (smaller share of the most frequent Terra cluster).
 """
 import argparse
 import json
@@ -43,7 +43,7 @@ def parse_args():
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--per-sheet", type=int, default=25)
-    p.add_argument("--reuse", action="store_true", help="признаки из dino_feats.npz")
+    p.add_argument("--reuse", action="store_true", help="features from dino_feats.npz")
     return p.parse_args()
 
 
@@ -63,12 +63,12 @@ def features(rows, root, a):
             acc.append(F.normalize(f.float(), dim=-1).cpu())
         ok_all.append(ok)
         if b % 50 == 0:
-            print(f"признаки: {(b + 1) * a.batch} из {len(rows)}", flush=True)
+            print(f"features: {(b + 1) * a.batch} of {len(rows)}", flush=True)
     return torch.cat(color), torch.cat(gray), torch.cat(ok_all)
 
 
 def kmeans(x, k, iters=40, restarts=3, seed=0):
-    """Сферический k-means (косинусная близость) с инициализацией k-means++. Возвращает метки и центры."""
+    """Spherical k-means (cosine similarity) with k-means++ initialization. Returns labels and centers."""
     x = x.cuda()
     best = None
     for r in range(restarts):
@@ -116,7 +116,7 @@ def main():
     hold = root / "terra_holdout.json"
     if not hold.exists():
         hold.write_text(json.dumps(sorted(random.Random(0).sample(terra, a.holdout)), ensure_ascii=False, indent=1))
-    print(f"Терра 1:1: {len(terra)} кадров, отложено {len(json.loads(hold.read_text()))}", flush=True)
+    print(f"Terra 1:1: {len(terra)} frames, held out {len(json.loads(hold.read_text()))}", flush=True)
 
     fpath = root / "dino_feats.npz"
     if a.reuse:
@@ -133,17 +133,17 @@ def main():
         lab = (f @ cent.T).argmax(1)
         counts = torch.bincount(lab[is_terra], minlength=a.k)
         share = counts.max().item() / counts.sum().item()
-        print(f"{name}: кадры Терры в {int((counts > 0).sum())} кластерах, самый частый {share:.0%}, "
-              f"размеры кластеров от {torch.bincount(lab, minlength=a.k).min().item()} до {torch.bincount(lab, minlength=a.k).max().item()}", flush=True)
+        print(f"{name}: Terra frames in {int((counts > 0).sum())} clusters, most frequent {share:.0%}, "
+              f"cluster sizes from {torch.bincount(lab, minlength=a.k).min().item()} to {torch.bincount(lab, minlength=a.k).max().item()}", flush=True)
         if best is None or share < best[0]:
             best = (share, name, lab)
     _, name, lab = best
     (root / "clusters.json").write_text(json.dumps(dict(k=a.k, features=name, assign={r["path"]: int(l) for r, l in zip(rows, lab.tolist())}),
                                                    ensure_ascii=False))
-    print(f"выбран вариант {name}, clusters.json записан", flush=True)
+    print(f"chose variant {name}, clusters.json written", flush=True)
     (root / "review").mkdir(exist_ok=True)
     sheets(rows, root, lab.tolist(), a.k, str(root / "review" / "clusters_{}.jpg"), a.per_sheet)
-    print("листы кластеров готовы", flush=True)
+    print("cluster sheets ready", flush=True)
 
 
 if __name__ == "__main__":

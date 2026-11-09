@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 """
-Прогоняет детектор по всем скачанным фото кошек большими батчами. Одна модель на один GPU.
+Runs the detector over all downloaded cat photos in large batches. One model per GPU.
 
-Запуск можно прервать и повторить: готовые файлы пропускаются. С --watch после обработки всего
-ждет новые файлы, поэтому задачу можно запускать, пока идет скачивание.
+The run can be interrupted and repeated: finished files are skipped. With --watch, after processing everything
+it waits for new files, so the job can be started while the download is still running.
 
-В <root>/detections/<model>_<source>.jsonl одна строка на файл:
-  f : путь относительно папки источника,  W, H : размер фото после поворота по EXIF,
-  b : все боксы кошек [уверенность, x1, y1, x2, y2], координаты в долях кадра.
-Без фильтра по уверенности выше --conf: пороги и согласие моделей считаются потом, без повторного прогона.
+<root>/detections/<model>_<source>.jsonl has one line per file:
+  f : path relative to the source folder,  W, H : photo size after EXIF rotation,
+  b : all cat boxes [confidence, x1, y1, x2, y2], coordinates as fractions of the frame.
+No confidence filter above --conf: thresholds and model agreement are computed later, without rerunning.
 
-Пример:
+Example:
   sbatch -p AMD7V12-RTX4500-CCP --gpus=1 -c 16 --mem=48G -t 08:00:00 -o runs/detect_%j.log \
       --wrap ".venv/bin/python -I detect_bulk.py --model yolo26x --watch 60"
 """
@@ -27,8 +27,8 @@ from torch.utils.data import DataLoader, Dataset
 from ultralytics import RTDETR, YOLO
 
 IMG_EXT = {".jpg", ".jpeg", ".png"}
-CAT = 15            # класс COCO
-PAD = 114 / 255     # серое поле, как в letterbox у ultralytics
+CAT = 15            # COCO class
+PAD = 114 / 255     # gray padding, as in ultralytics letterbox
 MODELS = {"yolo26x": (YOLO, "yolo26x.pt"), "rtdetr-x": (RTDETR, "rtdetr-x.pt")}
 SOURCES = {"popcats": "probe/popcats", "cati": "probe/cati", "oi": "oi/images", "inat": "inat/images"}
 
@@ -42,13 +42,13 @@ def parse_args():
     p.add_argument("--batch", type=int, default=128)
     p.add_argument("--workers", type=int, default=14)
     p.add_argument("--conf", type=float, default=0.05)
-    p.add_argument("--limit", type=int, default=0, help="для проверки: сколько файлов обработать")
-    p.add_argument("--watch", type=int, default=0, help="сколько минут ждать новые файлы после обработки всего")
+    p.add_argument("--limit", type=int, default=0, help="for testing: how many files to process")
+    p.add_argument("--watch", type=int, default=0, help="how many minutes to wait for new files after processing everything")
     return p.parse_args()
 
 
 class Images(Dataset):
-    """Фото -> квадрат size x size с серыми полями. Возвращает картинку, размеры и поля. Битый файл: W = 0."""
+    """Photo -> size x size square with gray padding. Returns the image, its dimensions and the padding. Broken file: W = 0."""
 
     def __init__(self, paths, size):
         self.paths, self.size = paths, size
@@ -61,7 +61,7 @@ class Images(Dataset):
         try:
             im = Image.open(self.paths[i])
             w0, h0 = im.size
-            im.draft("RGB", (2 * s, 2 * s))  # быстрое декодирование JPEG сразу в уменьшенном виде
+            im.draft("RGB", (2 * s, 2 * s))  # fast JPEG decoding directly at reduced size
             im = ImageOps.exif_transpose(im).convert("RGB")
             W, H = (w0, h0) if (im.width >= im.height) == (w0 >= h0) else (h0, w0)
             k = s / max(im.size)
@@ -76,7 +76,7 @@ class Images(Dataset):
 
 
 def pending(src_dir, done):
-    """Файлы папки, которых еще нет в результатах. Незаконченные загрузки (.tmp) не трогаем."""
+    """Files in the folder that are not in the results yet. Unfinished downloads (.tmp) are left alone."""
     if not src_dir.exists():
         return []
     return sorted(p for p in src_dir.rglob("*") if p.suffix.lower() in IMG_EXT and p.is_file()
@@ -101,8 +101,8 @@ def run_source(model, a, src_dir, paths, out_path):
             f.flush()
             n += len(res)
             if b % 20 == 0:
-                print(f"  {out_path.stem}: {n} из {len(paths)}, {n / (time.time() - t0):.1f} кадров/с", flush=True)
-    print(f"  {out_path.stem}: готово {n}, {n / (time.time() - t0):.1f} кадров/с", flush=True)
+                print(f"  {out_path.stem}: {n} of {len(paths)}, {n / (time.time() - t0):.1f} frames/s", flush=True)
+    print(f"  {out_path.stem}: done {n}, {n / (time.time() - t0):.1f} frames/s", flush=True)
 
 
 def main():
@@ -122,7 +122,7 @@ def main():
             paths = pending(src_dir, done)
             paths = paths[:a.limit] if a.limit else paths
             if paths:
-                print(f"{name}: новых файлов {len(paths)}, готово раньше {len(done)}", flush=True)
+                print(f"{name}: new files {len(paths)}, done earlier {len(done)}", flush=True)
                 run_source(model, a, src_dir, paths, out_path)
                 worked = True
         if a.limit or (not worked and idle >= a.watch):
@@ -130,7 +130,7 @@ def main():
         idle = 0 if worked else idle + 1
         if not worked:
             time.sleep(60)
-    print("готово", flush=True)
+    print("done", flush=True)
 
 
 if __name__ == "__main__":

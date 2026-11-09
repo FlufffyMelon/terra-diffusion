@@ -1,19 +1,19 @@
 #!/usr/bin/env python
 """
-Чистит датасет после build_manifest.py. Кадры Терры не трогает: они проверены глазами.
+Cleans the dataset after build_manifest.py. Terra frames are left alone: they were checked by eye.
 
-Сначала считает признаки каждого кадра и сохраняет в filter_features.npz, потом применяет пороги.
-С --reuse картинки не пересчитываются: вероятности по описаниям считаются заново из сохраненных эмбеддингов CLIP,
-поэтому можно менять и пороги, и сами описания в PROMPTS.
+First computes features for each frame and saves them to filter_features.npz, then applies the thresholds.
+With --reuse the images are not recomputed: probabilities for the text prompts are recomputed from the saved CLIP embeddings,
+so both the thresholds and the prompts themselves in PROMPTS can be changed.
 
-  CLIP по текстовым описаниям : рисунки, скриншоты, коллажи, игрушки, клетки, мертвые кошки, мертвая добыча, кадры без кошки
-  бокс кошки                  : размытые, слишком темные и пересвеченные
-  похожесть CLIP              : дубликаты и серии почти одинаковых кадров, из них остается самый большой
-  лимит на особь              : Cat Individuals, не больше --max-per-cat кадров на кошку
-  лимит на наблюдение         : iNaturalist, не больше --max-per-obs фото
+  CLIP text prompts          : drawings, screenshots, collages, toys, cages, dead cats, dead prey, frames without a cat
+  cat box                    : blurry, too dark and overexposed
+  CLIP similarity           : duplicates and series of nearly identical frames, the largest one is kept
+  per-individual limit       : Cat Individuals, at most --max-per-cat frames per cat
+  per-observation limit      : iNaturalist, at most --max-per-obs photos
 
-В датасете: manifest.jsonl становится чистым, полный лежит в manifest_full.jsonl, отброшенное в rejected.jsonl
-с причиной, ссылки на отброшенные кадры удаляются, в review/ листы случайных отказов по каждой причине.
+In the dataset: manifest.jsonl becomes the clean one, the full one is in manifest_full.jsonl, the dropped ones in rejected.jsonl
+with the reason, links to dropped frames are removed, review/ holds sheets of random rejections for each reason.
 """
 import argparse
 import json
@@ -33,43 +33,43 @@ from transformers import CLIPModel, CLIPTokenizer
 
 CLIP = "openai/clip-vit-large-patch14"
 MEAN, STD = (0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)
-# первая группа описывает нужные кадры, остальные причины отказа
+# the first group describes the wanted frames, the rest are rejection reasons
 PROMPTS = {
     "good": ["a photo of a cat", "a photo of a cat at home", "a photo of a cat outdoors", "a close-up photo of a cat"],
-    "рисунок": ["a drawing of a cat", "a cartoon of a cat", "a painting of a cat", "a digital illustration of a cat"],
-    "экран и текст": ["a screenshot of a phone", "a photo of a computer screen", "a poster with large text", "an image with a big watermark"],
-    "коллаж": ["a collage of several photos", "a grid of many images"],
-    "игрушка": ["a stuffed toy cat", "a cat statue", "a cat figurine", "a cat costume mascot"],
-    "клетка": ["a cat inside a metal wire cage", "a cat in an animal shelter cage", "a pink wire pet crate", "a cat behind bars"],
-    "мертвая": ["a dead cat", "a dead animal on the road"],
-    "добыча": ["a cat with a dead mouse", "a dead mouse on the floor", "a dead bird", "a cat holding prey in its mouth",
-               "a cat eating a mouse", "a dead rat"],
-    "нет кошки": ["a photo of a dog", "a photo of a person", "a photo of an empty room", "a photo of a plant"],
+    "drawing": ["a drawing of a cat", "a cartoon of a cat", "a painting of a cat", "a digital illustration of a cat"],
+    "screen_text": ["a screenshot of a phone", "a photo of a computer screen", "a poster with large text", "an image with a big watermark"],
+    "collage": ["a collage of several photos", "a grid of many images"],
+    "toy": ["a stuffed toy cat", "a cat statue", "a cat figurine", "a cat costume mascot"],
+    "cage": ["a cat inside a metal wire cage", "a cat in an animal shelter cage", "a pink wire pet crate", "a cat behind bars"],
+    "dead_cat": ["a dead cat", "a dead animal on the road"],
+    "prey": ["a cat with a dead mouse", "a dead mouse on the floor", "a dead bird", "a cat holding prey in its mouth",
+             "a cat eating a mouse", "a dead rat"],
+    "no_cat": ["a photo of a dog", "a photo of a person", "a photo of an empty room", "a photo of a plant"],
 }
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", required=True)
-    p.add_argument("--reuse", action="store_true", help="взять признаки из filter_features.npz")
-    p.add_argument("--dry-run", action="store_true", help="только посчитать и нарисовать листы, манифест не менять")
+    p.add_argument("--reuse", action="store_true", help="take features from filter_features.npz")
+    p.add_argument("--dry-run", action="store_true", help="only compute and draw the sheets, do not change the manifest")
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--workers", type=int, default=14)
-    p.add_argument("--thr", type=float, default=0.5, help="порог вероятности причины отказа")
-    p.add_argument("--thr-cage", type=float, default=0.3, help="порог для клеток: они хуже всего для фона")
-    p.add_argument("--thr-prey", type=float, default=0.3, help="порог для мертвой добычи: такие кадры недопустимы")
-    p.add_argument("--top", default="", help="причина, для которой нарисовать review/top_<причина>.jpg: самые вероятные кадры")
-    p.add_argument("--min-sharp", type=float, default=25.0, help="дисперсия лапласиана бокса 224x224")
+    p.add_argument("--thr", type=float, default=0.5, help="probability threshold for a rejection reason")
+    p.add_argument("--thr-cage", type=float, default=0.3, help="threshold for cages: they are the worst for the background")
+    p.add_argument("--thr-prey", type=float, default=0.3, help="threshold for dead prey: such frames are unacceptable")
+    p.add_argument("--top", default="", help="reason to draw review/top_<reason>.jpg for: the most likely frames")
+    p.add_argument("--min-sharp", type=float, default=25.0, help="Laplacian variance of the 224x224 box")
     p.add_argument("--min-bright", type=float, default=25.0)
     p.add_argument("--max-bright", type=float, default=235.0)
-    p.add_argument("--dup-cos", type=float, default=0.97, help="сходство CLIP, выше которого кадры считаем дубликатами")
+    p.add_argument("--dup-cos", type=float, default=0.97, help="CLIP similarity above which frames are considered duplicates")
     p.add_argument("--max-per-cat", type=int, default=8)
     p.add_argument("--max-per-obs", type=int, default=2)
     return p.parse_args()
 
 
 class Frames(Dataset):
-    """Кадр -> вход CLIP 224x224 и резкость и яркость бокса кошки. Битый файл: ok = False."""
+    """Frame -> 224x224 CLIP input plus sharpness and brightness of the cat box. Broken file: ok = False."""
 
     def __init__(self, rows, root):
         self.rows, self.root = rows, root
@@ -109,13 +109,13 @@ def compute(a, rows, root):
         sharp.append(s.numpy()); bright.append(br.numpy()); ok.append(good.numpy())
         n += len(x)
         if b % 20 == 0:
-            print(f"признаки: {n} из {len(rows)}, {n / (time.time() - t0):.0f} кадр/с", flush=True)
+            print(f"features: {n} of {len(rows)}, {n / (time.time() - t0):.0f} frames/s", flush=True)
     return dict(emb=np.concatenate(embs), sharp=np.concatenate(sharp), bright=np.concatenate(bright), ok=np.concatenate(ok))
 
 
 @torch.inference_mode()
 def text_probs(emb):
-    """Вероятность каждой группы PROMPTS для каждого кадра по эмбеддингам CLIP: softmax по всем описаниям, сумма по группе."""
+    """Probability of each PROMPTS group for each frame from CLIP embeddings: softmax over all prompts, summed over the group."""
     model = CLIPModel.from_pretrained(CLIP, local_files_only=True).cuda().eval()
     tok = CLIPTokenizer.from_pretrained(CLIP, local_files_only=True)
     texts = [t for g in PROMPTS.values() for t in g]
@@ -130,7 +130,7 @@ def text_probs(emb):
 
 
 def top_sheet(rows, p, root, path, n=96, T=220, C=12):
-    """Кадры с наибольшей вероятностью p, подпись: вероятность и источник. Для подбора порога глазами."""
+    """Frames with the highest probability p, caption: probability and source. For picking a threshold by eye."""
     font = ImageFont.load_default(size=13)
     idx = np.argsort(-p)[:n]
     S = Image.new("RGB", (C * T, ((len(idx) + C - 1) // C) * T), (25, 25, 25))
@@ -145,12 +145,12 @@ def top_sheet(rows, p, root, path, n=96, T=220, C=12):
 
 
 def duplicates(emb, order, cos):
-    """Номера кадров, у которых среди уже оставленных есть почти такой же. order: сначала более ценные кадры."""
+    """Indices of frames that have a nearly identical one among those already kept. order: more valuable frames first."""
     e = torch.from_numpy(emb[order]).float().cuda()
     keep = torch.ones(len(e), dtype=torch.bool, device="cuda")
     for s in range(0, len(e), 4096):
         q = e[s:s + 4096]
-        m = (q @ e[:s + len(q)].T) >= cos                       # сравниваем только с теми, кто раньше в порядке
+        m = (q @ e[:s + len(q)].T) >= cos                       # compare only with those earlier in the order
         m = m & keep[:s + len(q)][None, :]
         for j in range(len(q)):
             m[j, s + j:] = False
@@ -198,36 +198,36 @@ def main():
         if r["source"] == "terra":
             continue
         if not z["ok"][i]:
-            reasons[i] = "битый файл"
+            reasons[i] = "broken_file"
             continue
         p = dict(zip(names, z["probs"][i]))
-        if p["добыча"] >= a.thr_prey:
-            reasons[i] = "добыча"
+        if p["prey"] >= a.thr_prey:
+            reasons[i] = "prey"
             continue
-        if p["клетка"] >= a.thr_cage:
-            reasons[i] = "клетка"
+        if p["cage"] >= a.thr_cage:
+            reasons[i] = "cage"
             continue
-        bad = [n for n in names[1:] if n not in ("клетка", "добыча") and p[n] >= a.thr]
+        bad = [n for n in names[1:] if n not in ("cage", "prey") and p[n] >= a.thr]
         if bad:
             reasons[i] = max(bad, key=lambda n: p[n])
         elif z["sharp"][i] < a.min_sharp:
-            reasons[i] = "размытый"
+            reasons[i] = "blurry"
         elif z["bright"][i] < a.min_bright:
-            reasons[i] = "темный"
+            reasons[i] = "dark"
         elif z["bright"][i] > a.max_bright:
-            reasons[i] = "пересвеченный"
-    # отброшен прошлым запуском фильтра (ссылки уже нет), а правила сейчас его пропускают: решение не пересматриваем,
-    # иначе пограничные кадры возвращаются без файла и без латентов
+            reasons[i] = "overexposed"
+    # dropped by a previous filter run (the link is already gone) and the rules now let it through: the decision is not revisited,
+    # otherwise borderline frames come back without a file and without latents
     for i, r in enumerate(rows):
         if i not in reasons and r["source"] != "terra" and not (root / r["path"]).exists():
-            reasons[i] = "отброшен раньше"
+            reasons[i] = "rejected_earlier"
     left = np.array([i for i, r in enumerate(rows) if i not in reasons and r["source"] != "terra"])
     value = np.array([rows[i]["short"] + 1000 * rows[i]["fit_1x1"] for i in left])
     order = left[np.argsort(-value, kind="stable")]
     for i in duplicates(z["emb"], order, a.dup_cos):
-        reasons[i] = "дубликат"
+        reasons[i] = "duplicate"
     counts = Counter()
-    for i in order.tolist():                                   # сначала самые ценные кадры
+    for i in order.tolist():                                   # most valuable frames first
         if i in reasons:
             continue
         r = rows[i]
@@ -235,25 +235,25 @@ def main():
         if key:
             counts[key] += 1
             if counts[key] > cap:
-                reasons[i] = "лимит на кошку"
+                reasons[i] = "per_cat_limit"
     table = Counter(r["source"] for r in rows)
     rej = Counter((rows[i]["source"], w) for i, w in reasons.items())
-    lines = ["", "## После фильтра", "", "| Источник | Было | Осталось | 1:1 |", "|---|---|---|---|"]
+    lines = ["", "## After filter", "", "| Source | Before | Kept | 1:1 |", "|---|---|---|---|"]
     for s in table:
         kept = [r for i, r in enumerate(rows) if r["source"] == s and i not in reasons]
         lines.append(f"| {s} | {table[s]} | {len(kept)} | {sum(r['fit_1x1'] for r in kept)} |")
     kept = [r for i, r in enumerate(rows) if i not in reasons]
-    lines.append(f"| итого | {len(rows)} | {len(kept)} | {sum(r['fit_1x1'] for r in kept)} |")
-    lines += ["", "Причины отказа:", ""] + [f"- {s}, {w}: {n}" for (s, w), n in sorted(rej.items())]
+    lines.append(f"| total | {len(rows)} | {len(kept)} | {sum(r['fit_1x1'] for r in kept)} |")
+    lines += ["", "Rejection reasons:", ""] + [f"- {s}, {w}: {n}" for (s, w), n in sorted(rej.items())]
     print("\n".join(lines), flush=True)
     sheets(rows, reasons, root, root / "review")
     if a.top:
         p = z["probs"][:, names.index(a.top)].copy()
-        # Терру не трогаем, у кадров, отброшенных прошлым фильтром, ссылок уже нет
+        # Terra is left alone; frames dropped by a previous filter run no longer have links
         p[[r["source"] == "terra" or not (root / r["path"]).exists() for r in rows]] = -1
         top_sheet(rows, p, root, root / "review" / f"top_{a.top.replace(' ', '_')}.jpg")
         for thr in (0.1, 0.2, 0.3, 0.5):
-            print(f"{a.top}: p >= {thr}: {(p >= thr).sum()} кадров", flush=True)
+            print(f"{a.top}: p >= {thr}: {(p >= thr).sum()} frames", flush=True)
     if a.dry_run:
         return
     if not full.exists():
@@ -267,7 +267,7 @@ def main():
             (root / rows[i]["path"]).unlink(missing_ok=True)
     with open(root / "README.md", "a") as f:
         f.write("\n".join(lines) + "\n")
-    print("готово", flush=True)
+    print("done", flush=True)
 
 
 if __name__ == "__main__":

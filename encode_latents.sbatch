@@ -7,12 +7,12 @@
 #SBATCH --mem=48G
 #SBATCH -t 03:00:00
 #SBATCH -J ldm_encode
-#SBATCH --output=/home/CCP/semenchuk.aa/DiffusionLearn/runs/encode_%A_%a.log
+#SBATCH --output=runs/encode_%A_%a.log
 
-# Латенты по частям, одна часть на один GPU:
+# Latents in shards, one shard per GPU:
 #   sbatch --array=0-2 encode_latents.sbatch ~/DiffusionLearn_data/pretrain_v1
-# Аргументы после пути к датасету уходят в encode_latents.py.
+# Arguments after the dataset path go to encode_latents.py.
 
 DATASET=$1; shift
-cd /home/CCP/semenchuk.aa/DiffusionLearn
+cd "$SLURM_SUBMIT_DIR"   # submit from the project root
 .venv/bin/python encode_latents.py --dataset "$DATASET" --shard "$SLURM_ARRAY_TASK_ID" --nshards "$SLURM_ARRAY_TASK_COUNT" "$@"

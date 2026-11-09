@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 """
-Сравнение сэмплеров и autoguidance на одних и тех же стартовых шумах. Строка = вариант, столбец = шум.
+Comparison of samplers and autoguidance on the same starting noises. Row = variant, column = noise.
 
-Autoguidance (Karras et al. 2024): выход хорошей модели отодвигается от выхода слабой,
-  out = bad + w (good - bad),  w = 1 без направления. Слабая модель: ранний EMA-снимок того же запуска.
+Autoguidance (Karras et al. 2024): the output of the good model is pushed away from the output of the weak one,
+  out = bad + w (good - bad),  w = 1 without guidance. Weak model: an early EMA snapshot of the same run.
 
-Запуск: .venv/bin/python tools/compare_samplers.py runs/ldm_v2 [--n 8] [--seed 0]
-Результат: <run>/compare/samplers_seed<seed>.png и по картинке на вариант.
+Launch: .venv/bin/python tools/compare_samplers.py runs/ldm_v2 [--n 8] [--seed 0]
+Result: <run>/compare/samplers_seed<seed>.png and one image per variant.
 
-Свои строки вместо стандартного набора, все через SDE --steps шагов:
+Custom rows instead of the standard set, all via SDE with --steps steps:
   --rows "runs/ldm_v3/ckpt/last.ckpt" "runs/ldm_v3/ckpt/last.ckpt|runs/ldm_v2/ckpt/last.ckpt|1.5"
-  строка = чекпоинт или чекпоинт|слабая модель|w. Результат: <run>/compare/<--name>_seed<seed>.jpg
+  row = a checkpoint or checkpoint|weak model|w. Result: <run>/compare/<--name>_seed<seed>.jpg
 """
 import argparse
 import json
@@ -45,10 +45,10 @@ def main():
     p.add_argument("run")
     p.add_argument("--n", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--side", type=int, default=256, help="сторона картинки на общем листе")
-    p.add_argument("--rows", nargs="*", default=None, help="свои строки, см. описание вверху")
-    p.add_argument("--steps", type=int, default=250, help="шагов SDE для --rows")
-    p.add_argument("--name", default="rows", help="имя листа для --rows")
+    p.add_argument("--side", type=int, default=256, help="image side on the shared sheet")
+    p.add_argument("--rows", nargs="*", default=None, help="custom rows, see the description at the top")
+    p.add_argument("--steps", type=int, default=250, help="SDE steps for --rows")
+    p.add_argument("--name", default="rows", help="sheet name for --rows")
     a = p.parse_args()
     run = Path(a.run)
     cfg = json.loads((run / "config.json").read_text())
@@ -92,7 +92,7 @@ def main():
         good = load(run / "ckpt/last.ckpt")
         weak = {s: load(run / f"ema_{s:07d}.pt") for s in (5000, 10000)}
         variants = [
-        ("heun 50, rho 2 (как в обучении)", good, "heun", 50, 2.0),
+        ("heun 50, rho 2 (as in training)", good, "heun", 50, 2.0),
         ("heun 50, rho 1", good, "heun", 50, 1.0),
         ("heun 50, rho 3", good, "heun", 50, 3.0),
         ("heun 200, rho 2", good, "heun", 200, 2.0),
@@ -109,10 +109,10 @@ def main():
     out.mkdir(exist_ok=True)
     S, L = a.side, 300
     sheet = Image.new("RGB", (L + a.n * S, len(variants) * S), (255, 255, 255))
-    font = ImageFont.truetype(font_manager.findfont("DejaVu Sans"), 18)   # шрифт PIL по умолчанию без кириллицы
+    font = ImageFont.truetype(font_manager.findfont("DejaVu Sans"), 18)   # the default PIL font has no Cyrillic
     for r, (name, net, method, steps, rho) in enumerate(variants):
         t0 = time.time()
-        torch.manual_seed(a.seed)                                  # шум SDE одинаковый для всех вариантов
+        torch.manual_seed(a.seed)                                  # the SDE noise is the same for all variants
         with torch.no_grad():
             z = sample(net, sde, x0, steps=steps, rho=rho, method=method, amp_ctx=bf16, clip=False)
             x = torch.cat([vae.decode(z[i:i + 4].float() / cfg["scale"]).sample for i in range(0, len(z), 4)])
@@ -124,9 +124,9 @@ def main():
         row.save(out / f"{tag}_seed{a.seed}.jpg", quality=92)
         sheet.paste(row.resize((a.n * S, S), Image.LANCZOS), (L, r * S))
         ImageDraw.Draw(sheet).multiline_text((10, r * S + S // 2 - 30), name.replace(", ", ",\n"), fill=(0, 0, 0), font=font)
-        print(f"{name}: {time.time() - t0:.0f} с, std латента {z.std().item():.2f}", flush=True)
+        print(f"{name}: {time.time() - t0:.0f} s, latent std {z.std().item():.2f}", flush=True)
     sheet.save(out / f"{sheet_name}.jpg", quality=90)
-    print(f"готово: {out / f'{sheet_name}.jpg'}")
+    print(f"done: {out / f'{sheet_name}.jpg'}")
 
 
 if __name__ == "__main__":

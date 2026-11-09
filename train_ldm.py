@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """
-Латентная диффузия на Lightning, несколько GPU одного узла. Модель, расписание шума и сэмплер из train.py.
+Latent diffusion on Lightning, several GPUs of one node. The model, noise schedule and sampler are from train.py.
 
-Запуск: train_ldm.sbatch. Запуск с той же --out продолжается с last.ckpt.
-В --out: metrics.csv (eps-MSE как в train.py, сравним между запусками, норма градиента до обрезки, худшее внимание),
-attn.csv (максимум логитов и энтропия каждого блока внимания), samples/, ckpt/last.ckpt, ema_*.pt,
-raw/raw_*.pt (сырые веса в bf16, чтобы разбирать срывы обучения).
+Launch: train_ldm.sbatch. Launching with the same --out resumes from last.ckpt.
+In --out: metrics.csv (eps-MSE as in train.py, comparable between runs, gradient norm before clipping, worst attention),
+attn.csv (max logits and entropy of each attention block), samples/, ckpt/last.ckpt, ema_*.pt,
+raw/raw_*.pt (raw weights in bf16, for analyzing training blow-ups).
 """
 import argparse
 import copy
@@ -33,16 +33,16 @@ from train import VPSDE, cosine_lr, diffusion_loss, ema_update, sample, save_gri
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data", required=True, help="папка датасета с latents/")
+    p.add_argument("--data", required=True, help="dataset folder with latents/")
     p.add_argument("--out", required=True)
     p.add_argument("--devices", type=int, default=1)
-    p.add_argument("--batch", type=int, default=64, help="на один GPU")
-    p.add_argument("--workers", type=int, default=4, help="на один GPU")
+    p.add_argument("--batch", type=int, default=64, help="per GPU")
+    p.add_argument("--workers", type=int, default=4, help="per GPU")
     p.add_argument("--steps", type=int, default=30000)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr-min", type=float, default=1e-6)
-    p.add_argument("--warmup", type=int, default=2000, help="шагов линейного прогрева LR, потом косинус")
-    p.add_argument("--seed", type=int, default=0, help="у процесса номер r сид seed * 1000 + r")
+    p.add_argument("--warmup", type=int, default=2000, help="steps of linear LR warmup, then cosine")
+    p.add_argument("--seed", type=int, default=0, help="process number r gets seed seed * 1000 + r")
     p.add_argument("--ema", type=float, default=0.9999)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--pred", default="v", choices=["eps", "v"])
@@ -50,7 +50,7 @@ def parse_args():
     p.add_argument("--mults", default="1,2,3,4")
     p.add_argument("--num-res", type=int, default=2)
     p.add_argument("--attn-res", default="32,16,8")
-    p.add_argument("--head-ch", type=int, default=64, help="каналов на голову внимания, 0 = одна голова")
+    p.add_argument("--head-ch", type=int, default=64, help="channels per attention head, 0 = single head")
     p.add_argument("--qk-norm", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--no-compile", action="store_true")
@@ -59,20 +59,20 @@ def parse_args():
     p.add_argument("--sample-every", type=int, default=2500)
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--snapshot-every", type=int, default=5000)
-    p.add_argument("--raw-every", type=int, default=1000, help="сырые веса в raw/, 0 = не сохранять")
-    p.add_argument("--attn-every", type=int, default=100, help="статистика внимания на 8 латентах батча")
+    p.add_argument("--raw-every", type=int, default=1000, help="raw weights in raw/, 0 = do not save")
+    p.add_argument("--attn-every", type=int, default=100, help="attention statistics on 8 latents of the batch")
     p.add_argument("--n-samples", type=int, default=16)
     p.add_argument("--sample-method", default="sde", choices=["sde", "heun"],
-                   help="сэмплер сеток по ходу обучения: Heun 50 у ldm_v2 давал размазанные картинки, SDE 250 честнее")
+                   help="sampler for grids during training: Heun 50 on ldm_v2 gave smeared images, SDE 250 is more honest")
     p.add_argument("--sample-steps", type=int, default=250)
-    p.add_argument("--final-steps", type=int, default=1000, help="шагов SDE на финальной сетке")
-    p.add_argument("--limit", type=int, default=0, help="для проверки: кадров из датасета")
-    p.add_argument("--init", default="", help="ckpt/last.ckpt другого запуска: взять оттуда веса модели и EMA и его scale, "
-                                             "оптимизатор, шаги и расписание LR начать заново")
-    p.add_argument("--cond", action="store_true", help="условия кто (Терра или другая кошка) и тип (кластер DINOv2), данные CondLatents")
-    p.add_argument("--terra-frac", type=float, default=0.1, help="доля примеров с Террой при --cond")
-    p.add_argument("--p-drop", type=float, default=0.1, help="вероятность выбросить каждое условие, нужна для CFG")
-    p.add_argument("--sample-cfg", type=float, default=2.0, help="сила CFG на сетках по ходу обучения")
+    p.add_argument("--final-steps", type=int, default=1000, help="SDE steps for the final grid")
+    p.add_argument("--limit", type=int, default=0, help="for testing: number of frames from the dataset")
+    p.add_argument("--init", default="", help="ckpt/last.ckpt of another run: take the model and EMA weights and its scale from there, "
+                                             "start the optimizer, steps and LR schedule from scratch")
+    p.add_argument("--cond", action="store_true", help="conditions: who (Terra or another cat) and type (DINOv2 cluster), data CondLatents")
+    p.add_argument("--terra-frac", type=float, default=0.1, help="fraction of examples with Terra when --cond")
+    p.add_argument("--p-drop", type=float, default=0.1, help="probability of dropping each condition, needed for CFG")
+    p.add_argument("--sample-cfg", type=float, default=2.0, help="CFG strength on grids during training")
     return p.parse_args()
 
 
@@ -85,7 +85,7 @@ class LDM(L.LightningModule):
                           head_ch=a.head_ch or None, qk_norm=a.qk_norm, cond_sizes=a.cond_sizes)
         self.ema = copy.deepcopy(self.model).eval().requires_grad_(False)
         self.sde = VPSDE(pred=a.pred)
-        # в списке, чтобы Lightning не считал это отдельным подмодулем с другими именами весов
+        # in a list so that Lightning does not treat it as a separate submodule with different weight names
         self.net = [self.model if a.no_compile else torch.compile(self.model)]
         self.t_log, self.acc, self.gnorm = time.time(), [], []
         self.attn_last = (float("nan"), float("nan"))
@@ -97,14 +97,14 @@ class LDM(L.LightningModule):
         return dict(optimizer=opt, lr_scheduler=dict(scheduler=sched, interval="step"))
 
     def on_train_start(self):
-        # seed_everything дал всем процессам один сид, и t, шум и dropout совпадали на всех GPU.
-        # Шаг в сиде: после продолжения с чекпоинта шум не повторяет начало обучения
+        # seed_everything gave all processes the same seed, so t, noise and dropout coincided on all GPUs.
+        # Step in the seed: after resuming from a checkpoint the noise does not repeat the start of training
         torch.manual_seed(self.a.seed * 1000 + self.global_rank + 1_000_003 * self.global_step)
 
     def on_fit_start(self):
-        # какой физический GPU у процесса: чтобы сбой CUDA можно было привязать к карте
+        # which physical GPU the process has: so a CUDA failure can be tied to a card
         pr = torch.cuda.get_device_properties(self.device)
-        print(f"процесс {self.global_rank}: {platform.node()}, GPU {self.device}, pci {getattr(pr, 'pci_bus_id', '?')}, "
+        print(f"process {self.global_rank}: {platform.node()}, GPU {self.device}, pci {getattr(pr, 'pci_bus_id', '?')}, "
               f"uuid {getattr(pr, 'uuid', '?')}", flush=True)
         self.vae = None
         if self.trainer.is_global_zero:
@@ -131,7 +131,7 @@ class LDM(L.LightningModule):
         if self.a.cond:
             x0, y = batch
             terra = y[:, 0] == 1
-            # каждое условие выбрасывается независимо: модель учится всем режимам, нужным для CFG
+            # each condition is dropped independently: the model learns all the modes needed for CFG
             y = y.clone()
             y[torch.rand(len(y), device=y.device) < self.a.p_drop, 0] = self.a.cond_sizes[0]
             y[torch.rand(len(y), device=y.device) < self.a.p_drop, 1] = self.a.cond_sizes[1]
@@ -140,21 +140,21 @@ class LDM(L.LightningModule):
             x0, net, terra = batch, self.net[0], None
         loss, t, per = diffusion_loss(net, self.sde, x0)
         if self.global_step == 0 and idx == 0:
-            first = self.all_gather(t[:3].detach())          # (процессов, 3): строки должны различаться
+            first = self.all_gather(t[:3].detach())          # (processes, 3): rows must differ
             if self.trainer.is_global_zero:
-                print("первые t на каждом процессе:\n" + "\n".join(" ".join(f"{v:.4f}" for v in r) for r in first.view(-1, 3).tolist()), flush=True)
+                print("first t on each process:\n" + "\n".join(" ".join(f"{v:.4f}" for v in r) for r in first.view(-1, 3).tolist()), flush=True)
         self.acc.append((t.detach(), per.detach(), None if terra is None else terra.detach()))
         return loss
 
     def on_before_optimizer_step(self, optimizer):
-        # градиенты уже сложены между процессами, но еще не обрезаны
+        # gradients are already summed across processes, but not yet clipped
         if self.trainer.is_global_zero:
             grads = [p.grad for p in self.model.parameters() if p.grad is not None]
             self.gnorm.append(torch.linalg.vector_norm(torch.stack(torch._foreach_norm(grads))).detach())
 
     @torch.no_grad()
     def attn_stats(self, x0):
-        """Максимум логитов и средняя энтропия внимания (доля от log N) каждого блока на 8 латентах, t от 0.05 до 0.95."""
+        """Max logits and mean attention entropy (fraction of log N) of each block on 8 latents, t from 0.05 to 0.95."""
         x0 = x0[:8].float()
         n = len(x0)
         t = torch.linspace(0.05, 0.95, n, device=x0.device)
@@ -198,7 +198,7 @@ class LDM(L.LightningModule):
             b = torch.bucketize(t, torch.linspace(0, 1, 6, device=t.device)[1:-1])
             bins = [per[b == i].mean().item() if (b == i).any() else float("nan") for i in range(5)]
             g = torch.stack(self.gnorm) if self.gnorm else torch.full((1,), float("nan"))
-            # лосс на Терре: если он уходит заметно ниже общего, модель начинает запоминать ее фото
+            # loss on Terra: if it drops noticeably below the overall one, the model starts memorizing its photos
             m = torch.cat([v[2] for v in self.acc]) if a.cond else None
             lt = per[m].mean().item() if m is not None and m.any() else float("nan")
             ips = len(self.acc) / (time.time() - self.t_log)
@@ -208,10 +208,10 @@ class LDM(L.LightningModule):
                                 f"{g.mean().item():.4g}", f"{g.max().item():.4g}", f"{am:.4g}", f"{ae:.4f}", f"{lt:.5f}"])
             self.log_f.flush()
             eta = (a.steps - s) / max(ips, 1e-9) / 3600
-            print(f"step {s:7d} | loss {per.mean().item():.4f} | по t: " + " ".join(f"{v:.3f}" for v in bins)
-                  + (f" | Терра {lt:.4f}" if a.cond else "")
+            print(f"step {s:7d} | loss {per.mean().item():.4f} | by t: " + " ".join(f"{v:.3f}" for v in bins)
+                  + (f" | Terra {lt:.4f}" if a.cond else "")
                   + f" | grad {g.mean().item():.3f} (max {g.max().item():.3f}) | attn max {am:.1f}, ent min {ae:.2f}"
-                  + f" | lr {lr:.1e} | {ips:.2f} it/s | осталось ~{eta:.1f} ч", flush=True)
+                  + f" | lr {lr:.1e} | {ips:.2f} it/s | ~{eta:.1f} h left", flush=True)
             self.acc.clear()
             self.gnorm.clear()
             self.t_log = time.time()
@@ -229,10 +229,10 @@ class LDM(L.LightningModule):
         t0 = time.time()
         method = method or self.a.sample_method
         bf16 = lambda: torch.autocast("cuda", dtype=torch.bfloat16)
-        # шум SDE одинаковый на всех сетках; fork_rng возвращает генератор обучения в прежнее состояние
+        # SDE noise is the same on all grids; fork_rng restores the training generator to its previous state
         net = self.ema
         if self.a.cond:
-            # первая половина: просто Терра, вторая: Терра и ее тип; CFG от ответа без условий
+            # first half: just Terra, second: Terra and its type; CFG from the response without conditions
             w, k = self.a.cond_sizes
             n = len(self.noise)
             y = torch.tensor([[1, k]] * (n // 2) + [[1, self.a.terra_type]] * (n - n // 2), device=self.device)
@@ -241,10 +241,10 @@ class LDM(L.LightningModule):
             torch.manual_seed(1234)
             z = sample(net, self.sde, self.noise, steps=steps or self.a.sample_steps, rho=1.0 if method == "sde" else 2.0,
                        method=method, amp_ctx=bf16, clip=False)
-        with torch.autocast("cuda", enabled=False):   # Lightning держит bf16 снаружи, VAE считаем в float32
+        with torch.autocast("cuda", enabled=False):   # Lightning keeps bf16 outside, the VAE runs in float32
             x = torch.cat([self.vae[0].decode(z[i:i + 4].float() / self.scale).sample for i in range(0, len(z), 4)])
         save_grid(x, path, nrow=4, upscale=1)
-        print(f"  сэмплы {path.name}: {time.time() - t0:.0f} с, std латента {z.std().item():.2f}", flush=True)
+        print(f"  samples {path.name}: {time.time() - t0:.0f} s, latent std {z.std().item():.2f}", flush=True)
 
     def on_train_end(self):
         if self.trainer.is_global_zero:
@@ -252,7 +252,7 @@ class LDM(L.LightningModule):
 
 
 def lr_at(step, a):
-    """Линейный прогрев до a.lr за a.warmup шагов, затем косинус до a.lr_min к шагу a.steps."""
+    """Linear warmup to a.lr over a.warmup steps, then cosine down to a.lr_min by step a.steps."""
     if step < a.warmup:
         return a.lr * (step + 1) / a.warmup
     return cosine_lr(step - a.warmup, a.steps - a.warmup, a.lr, a.lr_min)
@@ -263,22 +263,22 @@ def main():
     L.seed_everything(0, workers=True)
     torch.set_float32_matmul_precision("high")
     ds = CondLatents(a.data, a.terra_frac, a.limit) if a.cond else CatLatents(a.data, a.limit)
-    # сохраняются в config.json: по ним ноутбук и метрики собирают модель
+    # saved to config.json: the notebook and metrics build the model from them
     a.cond_sizes = [2, ds.k] if a.cond else []
     if a.cond:
-        # тип Терры для сеток по ходу обучения: ее самый частый кластер
+        # Terra type for grids during training: its most frequent cluster
         a.terra_type = torch.bincount(ds.scene_t, minlength=ds.k).argmax().item()
-        print(f"Терра: {len(ds.zt)} кадров по {ds.zt.shape[1]} кропов, доля в примерах {a.terra_frac}, "
-              f"кластеров {ds.k}, кластеры Терры {torch.bincount(ds.scene_t, minlength=ds.k).nonzero().flatten().tolist()}, "
-              f"основной {a.terra_type}", flush=True)
+        print(f"Terra: {len(ds.zt)} frames with {ds.zt.shape[1]} crops each, fraction of examples {a.terra_frac}, "
+              f"clusters {ds.k}, Terra clusters {torch.bincount(ds.scene_t, minlength=ds.k).nonzero().flatten().tolist()}, "
+              f"main one {a.terra_type}", flush=True)
     if a.init:
-        # модель училась на латентах с этим масштабом, пересчитанный по другому набору кадров чуть отличается
+        # the model was trained on latents with this scale; recomputed on a different set of frames it differs slightly
         ds.scale = json.loads((Path(a.init).parent.parent / "config.json").read_text())["scale"]
-    print(f"кадров {len(ds)} (нет в манифесте {ds.dropped}), кропов на кадр {ds.z.shape[1]}, scale {ds.scale:.5f}", flush=True)
+    print(f"frames {len(ds)} (not in manifest {ds.dropped}), crops per frame {ds.z.shape[1]}, scale {ds.scale:.5f}", flush=True)
     loader = DataLoader(ds, batch_size=a.batch, shuffle=True, drop_last=True, num_workers=a.workers, pin_memory=True,
                         persistent_workers=a.workers > 0)
     module = LDM(a, ds.scale)
-    print(f"U-Net: {sum(p.numel() for p in module.model.parameters()) / 1e6:.0f} M параметров", flush=True)
+    print(f"U-Net: {sum(p.numel() for p in module.model.parameters()) / 1e6:.0f} M parameters", flush=True)
     ckpt = ModelCheckpoint(dirpath=Path(a.out) / "ckpt", filename="step", every_n_train_steps=a.ckpt_every, save_last=True, save_top_k=0)
     trainer = L.Trainer(accelerator="gpu", devices=a.devices, strategy=DDPStrategy(find_unused_parameters=False) if a.devices > 1 else "auto",
                         precision="bf16-mixed", max_steps=a.steps, gradient_clip_val=a.grad_clip, callbacks=[ckpt], logger=False,
@@ -287,9 +287,9 @@ def main():
     if a.init and not last.exists():
         sd = torch.load(a.init, map_location="cpu", weights_only=False, mmap=True)["state_dict"]
         res = module.load_state_dict(sd, strict=False)
-        # в модели без условий нет только эмбеддингов условий, они стартуют с нуля
+        # in the unconditional model only the condition embeddings are missing, they start from zero
         assert not res.unexpected_keys and all(".cond." in k for k in res.missing_keys), res
-        print(f"веса модели и EMA из {a.init}, новые слои: {len(res.missing_keys)} тензоров", flush=True)
+        print(f"model and EMA weights from {a.init}, new layers: {len(res.missing_keys)} tensors", flush=True)
     trainer.fit(module, loader, ckpt_path=str(last) if last.exists() else None)
 
 

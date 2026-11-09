@@ -1,5 +1,5 @@
-# Кроп с боксом: остаются good, edge_soft, edge_hard из crop_eval.csv
-photo_28_2026-10-30_23-13-18.jpg   # удалено из датасета
+# Crop with box: good, edge_soft, edge_hard from crop_eval.csv are kept
+photo_28_2026-10-30_23-13-18.jpg   # removed from the dataset
 1b88d280-00dd-410e-8489-f3d285263fe6.jpg   # no_fit_whole
 2ce937bc-1d90-4d65-8d75-e04b6b160a09.jpg   # no_fit_edge
 4be5608c-9858-4a0e-bb77-a3ef2a790c06.jpg   # no_fit_edge

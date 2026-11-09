@@ -1,11 +1,11 @@
 """
-U-Net для диффузионной модели в стиле DDPM.
+U-Net for a DDPM-style diffusion model.
 
-Вход:  шумная картинка x_t (B, 3, S, S) и уровень шума c (B,), по умолчанию c = log(sigma/m)
-Выход: предсказанный шум того же размера (B, 3, S, S)
+Input:  noisy image x_t (B, 3, S, S) and noise level c (B,), by default c = log(sigma/m)
+Output: predicted noise of the same size (B, 3, S, S)
 
-Энкодер уменьшает разрешение в 2 раза на каждом уровне, декодер увеличивает обратно,
-skip-соединения склеивают выходы энкодера со входами декодера по каналам.
+The encoder halves the resolution at each level, the decoder increases it back,
+skip connections concatenate the encoder outputs with the decoder inputs along channels.
 """
 import math
 
@@ -15,13 +15,13 @@ import torch.nn.functional as F
 
 
 def gn(ch, groups=32):
-    """GroupNorm. Внимание: при groups = ch это нормировка каждого канала отдельно, и сеть
-    теряет средний уровень каждого канала, а с ним и средний цвет картинки."""
+    """GroupNorm. Note: with groups = ch this normalizes each channel separately, and the network
+    loses the mean level of each channel, and with it the mean color of the image."""
     return nn.GroupNorm(math.gcd(groups, ch), ch)
 
 
 class NoiseEmbedding(nn.Module):
-    """Синусы и косинусы от уровня шума c с гладкими частотами, затем MLP."""
+    """Sines and cosines of the noise level c with smooth frequencies, then an MLP."""
 
     def __init__(self, dim, out_dim, f_min=1.0, f_max=8.0):
         super().__init__()
@@ -36,7 +36,7 @@ class NoiseEmbedding(nn.Module):
 
 
 class ResBlock(nn.Module):
-    """GN -> SiLU -> Conv3x3 -> + сдвиг от шума -> GN -> SiLU -> Dropout -> Conv3x3, плюс обход."""
+    """GN -> SiLU -> Conv3x3 -> + noise shift -> GN -> SiLU -> Dropout -> Conv3x3, plus a skip path."""
 
     def __init__(self, in_ch, out_ch, emb_dim, dropout, groups=32):
         super().__init__()
@@ -46,7 +46,7 @@ class ResBlock(nn.Module):
         self.norm2 = gn(out_ch, groups)
         self.drop = nn.Dropout(dropout)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        nn.init.zeros_(self.conv2.weight)  # блок стартует как тождественный
+        nn.init.zeros_(self.conv2.weight)  # the block starts as identity
         nn.init.zeros_(self.conv2.bias)
         self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
@@ -59,10 +59,10 @@ class ResBlock(nn.Module):
 
 class AttnBlock(nn.Module):
     """
-    Self-attention по всем точкам карты признаков.
-      head_ch : каналов на голову, None = одна голова на все каналы, как было раньше
-      qk_norm : RMSNorm на q и k каждой головы. Без нее логиты q.k растут вместе с весами,
-                и softmax схлопывается в одну точку (так сломался ldm_v1).
+    Self-attention over all points of the feature map.
+      head_ch : channels per head, None = one head over all channels, as before
+      qk_norm : RMSNorm on q and k of each head. Without it the q.k logits grow with the weights,
+                and softmax collapses to a single point (this is how ldm_v1 broke).
     """
 
     def __init__(self, ch, groups=32, head_ch=None, qk_norm=False):
@@ -78,19 +78,19 @@ class AttnBlock(nn.Module):
         self.k_norm = nn.RMSNorm(d, eps=1e-6) if qk_norm else None
 
     def qkv_heads(self, x):
-        """(B, C, H, W) -> q, k, v, каждый (B, heads, N, C / heads). Канал c головы h это h * d + c."""
+        """(B, C, H, W) -> q, k, v, each (B, heads, N, C / heads). Channel c of head h is h * d + c."""
         B, C, H, W = x.shape
-        # contiguous: flash attention берет только тензоры с непрерывной последней осью,
-        # иначе SDPA строит полную матрицу внимания N x N на каждую голову
+        # contiguous: flash attention only takes tensors with a contiguous last axis,
+        # otherwise SDPA builds the full N x N attention matrix for each head
         qkv = self.qkv(self.norm(x)).reshape(B, 3, self.heads, C // self.heads, H * W)
         q, k, v = qkv.permute(1, 0, 2, 4, 3).contiguous().unbind(0)
         if self.q_norm is not None:
-            # нормировка в float32, обратно в тип v, потому что SDPA требует один тип у q, k, v
+            # normalization in float32, cast back to the dtype of v, because SDPA requires the same dtype for q, k, v
             q, k = self.q_norm(q.float()).to(v.dtype), self.k_norm(k.float()).to(v.dtype)
         return q, k, v
 
     def logits(self, x):
-        """Логиты внимания (B, heads, N, N) в float32, для диагностики."""
+        """Attention logits (B, heads, N, N) in float32, for diagnostics."""
         q, k, _ = self.qkv_heads(x)
         return q.float() @ k.float().transpose(-1, -2) / math.sqrt(q.shape[-1])
 
@@ -103,7 +103,7 @@ class AttnBlock(nn.Module):
 
 
 class Stage(nn.Module):
-    """Residual-блок и, если нужно, внимание после него."""
+    """Residual block and, if needed, attention after it."""
 
     def __init__(self, in_ch, out_ch, emb_dim, dropout, attn, groups=32, head_ch=None, qk_norm=False):
         super().__init__()
@@ -115,7 +115,7 @@ class Stage(nn.Module):
 
 
 class Downsample(nn.Module):
-    """Свертка 3x3 с шагом 2: разрешение / 2, каналы те же."""
+    """3x3 convolution with stride 2: resolution / 2, same channels."""
 
     def __init__(self, ch):
         super().__init__()
@@ -126,7 +126,7 @@ class Downsample(nn.Module):
 
 
 class Upsample(nn.Module):
-    """Повтор каждой точки в квадрат 2x2, затем свертка 3x3."""
+    """Repeat each point into a 2x2 square, then a 3x3 convolution."""
 
     def __init__(self, ch):
         super().__init__()
@@ -138,21 +138,21 @@ class Upsample(nn.Module):
 
 class UNet(nn.Module):
     """
-    img_size : размер входной картинки (нужен, чтобы знать, где ставить внимание)
-    base     : число каналов на верхнем уровне
-    mults    : множители каналов по уровням; len(mults) = число уровней,
-               при img_size = 64 и 4 уровнях разрешения 64, 32, 16, 8
-    num_res  : residual-блоков на уровень в энкодере (в декодере на один больше)
-    attn_res : разрешения, на которых после каждого res-блока стоит внимание
-    dropout  : доля зануляемых признаков внутри res-блоков
-    norm_groups : число групп в GroupNorm (не больше, чем каналов). В DDPM на CIFAR 32 группы
-               на 128 каналов, по 4 канала в группе. 32 группы на 32 канала ломают средний цвет.
-    head_ch  : каналов на голову внимания, None = одна голова (старые модели)
-    qk_norm  : RMSNorm на q и k во всех блоках внимания
-    cond_sizes : число значений каждого условия, например (2, 100): кто (другая кошка, Терра) и тип (кластер DINOv2).
-               У каждого условия своя таблица эмбеддингов с лишним значением «пусто» (номер size) для CFG.
-               Эмбеддинги складываются с эмбеддингом шума и стартуют с нуля: дообучение с весов модели
-               без условий начинается ровно с ее поведения.
+    img_size : size of the input image (needed to know where to put attention)
+    base     : number of channels at the top level
+    mults    : channel multipliers per level; len(mults) = number of levels,
+               for img_size = 64 and 4 levels the resolutions are 64, 32, 16, 8
+    num_res  : residual blocks per level in the encoder (the decoder has one more)
+    attn_res : resolutions at which attention follows each res block
+    dropout  : fraction of features zeroed inside res blocks
+    norm_groups : number of GroupNorm groups (at most the number of channels). In DDPM on CIFAR 32 groups
+               for 128 channels, 4 channels per group. 32 groups on 32 channels break the mean color.
+    head_ch  : channels per attention head, None = one head (old models)
+    qk_norm  : RMSNorm on q and k in all attention blocks
+    cond_sizes : number of values of each condition, e.g. (2, 100): who (another cat, Terra) and type (DINOv2 cluster).
+               Each condition has its own embedding table with an extra "empty" value (index size) for CFG.
+               The embeddings are added to the noise embedding and start from zero: fine-tuning from the weights of a model
+               without conditions starts exactly from its behavior.
     """
 
     def __init__(self, img_size=64, in_ch=3, base=64, mults=(1, 2, 3, 4), num_res=2, attn_res=(16,), dropout=0.1,
@@ -170,7 +170,7 @@ class UNet(nn.Module):
             nn.init.zeros_(e.weight)
         self.conv_in = nn.Conv2d(in_ch, base, 3, padding=1)
 
-        # энкодер: запоминаем число каналов каждого skip-соединения
+        # encoder: remember the number of channels of each skip connection
         self.down = nn.ModuleList()
         skip_ch = [base]
         ch, res = base, img_size
@@ -189,7 +189,7 @@ class UNet(nn.Module):
         self.mid_attn = AttnBlock(ch, g, **att)
         self.mid2 = ResBlock(ch, ch, emb_dim, dropout, g)
 
-        # декодер: на каждом блоке приклеиваем skip с того же разрешения
+        # decoder: at each block concatenate the skip from the same resolution
         self.up = nn.ModuleList()
         for lvl, mult in reversed(list(enumerate(mults))):
             out = base * mult
@@ -200,13 +200,13 @@ class UNet(nn.Module):
                 self.up.append(Upsample(ch))
                 res *= 2
 
-        self.norm_out = gn(ch, g)  # последняя нормировка перед выходом: через нее идет весь ответ сети
+        self.norm_out = gn(ch, g)  # the last normalization before the output: the whole network response passes through it
         self.conv_out = nn.Conv2d(ch, in_ch, 3, padding=1)
-        nn.init.zeros_(self.conv_out.weight)  # в начале сеть выдает 0, лосс = 1
+        nn.init.zeros_(self.conv_out.weight)  # at the start the network outputs 0, loss = 1
         nn.init.zeros_(self.conv_out.bias)
 
     def forward(self, x, c, y=None):
-        """y : (B, число условий) long, значение size = «пусто». None = все условия пустые."""
+        """y : (B, number of conditions) long, value size = "empty". None = all conditions empty."""
         emb = self.embed(c)
         if len(self.cond):
             if y is None:
