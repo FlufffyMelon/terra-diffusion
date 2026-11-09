@@ -6,8 +6,7 @@
 /reports/
 /dataset_unique/
 /dataset_unique_crop_eval/
-/dataset_unique_labeled/*
-!/dataset_unique_labeled/boxes.json
+/dataset_unique_labeled/
 
 # environment
 .venv/

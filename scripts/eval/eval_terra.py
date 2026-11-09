@@ -5,7 +5,7 @@ How well the conditional model draws Terra: similarity, novelty, diversity. All 
   similarity: logistic regression "Terra / another cat" on the Terra training frames and random other cats.
                Its accuracy on the held-out frames of terra_holdout.json is printed as a check. Metric: the fraction of samples
                it considers Terra (p > 0.5).
-  copies    : as in memorization.py, but for 512 px. Each Terra training photo is expanded into crops by the training
+  copies    : as in experiments/pixel64/memorization.py, but for 512 px. Each Terra training photo is expanded into crops by the training
                rule (box inside, several sizes and shifts, flip) at 64x64. For a sample d1 = distance
                to the nearest photo, d2 = to the second nearest different photo, ratio = d1 / d2. A copy is close to one photo
                much more than to the others: ratio < 0.7. Calibration: the same for the held-out real photos.
@@ -18,13 +18,12 @@ Variants: lines like "w=3" or "w=3,type=terra" or "w=3,ag=runs/ldm_v4/ema_000500
   w     : CFG strength over the conditions relative to the response without conditions
   type  : none (default, type "empty"), terra (the main Terra cluster) or a cluster index
   ag    : autoguidance with a weak model with the same conditions, path@w
-.venv/bin/python tools/eval_terra.py --ckpt runs/ldm_v4/ema_0020000.pt --dataset ~/DiffusionLearn_data/pretrain_v1 \\
+.venv/bin/python scripts/eval/eval_terra.py --ckpt runs/ldm_v4/ema_0020000.pt --dataset ~/DiffusionLearn_data/pretrain_v1 \\
     --out runs/eval/terra_v4 --rows w=1 w=2 w=3 "w=3,type=terra"
 """
 import argparse
 import csv
 import json
-import math
 import sys
 import time
 from pathlib import Path
@@ -32,19 +31,16 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchvision.transforms.v2.functional as TF
 from diffusers import AutoencoderKL
-from PIL import Image, ImageOps
 from torchvision.utils import save_image
 from transformers import AutoModel
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from dataset import FrameCrops, read_manifest
-from guidance import CFG, Guided
-from memorization import build_refs, kid, nearest
-from models import UNet
-from tools.eval_metrics import fd
-from train import VPSDE, crop_offsets, min_crop_side, sample, to_unit
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # repository root: terra_diffusion imports without installing
+from terra_diffusion.checkpoints import load_unet
+from terra_diffusion.data import FrameCrops, read_manifest
+from terra_diffusion.diffusion import VPSDE, sample
+from terra_diffusion.guidance import CFG, Guided
+from terra_diffusion.metrics import copy_ratio, copy_refs, fd, kid, random_crops
 
 DINO = "facebook/dinov2-large"
 
@@ -60,60 +56,6 @@ def parse_args():
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
-
-
-def load_unet(path, dev):
-    path = Path(path)
-    run = path.parent.parent if path.parent.name == "ckpt" else path.parent
-    cfg = json.loads((run / "config.json").read_text())
-    ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
-    sd = ck["ema"] if "ema" in ck else {k[4:]: v for k, v in ck["state_dict"].items() if k.startswith("ema.")}
-    m = UNet(img_size=64, in_ch=4, base=cfg["base"], mults=[int(v) for v in cfg["mults"].split(",")], num_res=cfg["num_res"],
-             attn_res=[int(v) for v in cfg["attn_res"].split(",")], dropout=cfg["dropout"], norm_groups=32,
-             head_ch=cfg.get("head_ch") or None, qk_norm=cfg.get("qk_norm", False), cond_sizes=cfg.get("cond_sizes", []))
-    m.load_state_dict(sd)
-    return m.to(dev).eval().requires_grad_(False), cfg, f"{run.name}-{ck.get('step', ck.get('global_step'))}"
-
-
-def load_photos(root, rows, short=256):
-    """Photo with the short side reduced and the cat box in pixels: (3, H, W) uint8 and (x1, y1, x2, y2)."""
-    imgs, boxes = [], []
-    for r in rows:
-        im = ImageOps.exif_transpose(Image.open(root / r["path"])).convert("RGB")
-        k = short / min(im.size)
-        t = TF.pil_to_tensor(im.resize((round(im.size[0] * k), round(im.size[1] * k)), Image.BICUBIC))
-        _, H, W = t.shape
-        b = r["box"]
-        imgs.append(t)
-        boxes.append((max(math.floor(b[0] * W), 0), max(math.floor(b[1] * H), 0), min(math.ceil(b[2] * W), W), min(math.ceil(b[3] * H), H)))
-    return imgs, boxes
-
-
-def copy_refs(root, train_rows, size=64, npos=5, nsides=5):
-    """Crops of the Terra training photos by the training rule: (M, 3*size*size) on the GPU and the photo index of each crop."""
-    imgs, boxes = load_photos(root, train_rows)
-    refs, owner = build_refs(imgs, size, None, npos, boxes=boxes, nsides=nsides)
-    return refs.flatten(1).cuda(), owner.cuda()
-
-
-def random_crops(root, rows, size=64, seed=0):
-    """One random crop per photo by the training rule, in [-1, 1]: calibration on the held-out photos."""
-    g = torch.Generator().manual_seed(seed)
-    out = []
-    for img, box in zip(*load_photos(root, rows)):
-        _, H, W = img.shape
-        side = torch.randint(min_crop_side(box, H, W, size), min(H, W) + 1, (1,), generator=g).item()
-        t0, t1, l0, l1 = crop_offsets(box, H, W, side)
-        y, x = torch.randint(t0, t1 + 1, (1,), generator=g).item(), torch.randint(l0, l1 + 1, (1,), generator=g).item()
-        out.append(to_unit(TF.resize(img[:, y:y + side, x:x + side][None], [size, size], antialias=True))[0])
-    return torch.stack(out)
-
-
-def copy_ratio(img, refs, owner, n_img, size=64):
-    """img : (B, 3, S, S) in [-1, 1] -> ratio = d1 / d2 and the index of the nearest photo."""
-    q = F.interpolate(img.float(), size=(size, size), mode="bilinear", align_corners=False, antialias=True)
-    d1, d2, nn_img, _ = nearest(q.flatten(1).cuda(), refs, owner, n_img)
-    return d1 / d2, nn_img
 
 
 def logreg(x, y, iters=500, wd=1e-4):

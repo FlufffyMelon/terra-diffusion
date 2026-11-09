@@ -12,7 +12,7 @@ No confidence filter above --conf: thresholds and model agreement are computed l
 
 Example:
   sbatch -p AMD7V12-RTX4500-CCP --gpus=1 -c 16 --mem=48G -t 08:00:00 -o runs/detect_%j.log \
-      --wrap ".venv/bin/python -I detect_bulk.py --model yolo26x --watch 60"
+      --wrap ".venv/bin/python -I scripts/data/detect_bulk.py --model yolo26x --watch 60"
 """
 import argparse
 import json
@@ -20,7 +20,6 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 import torchvision.transforms.v2.functional as TF
 from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, Dataset

@@ -6,7 +6,7 @@ with a rotated label on the left of each row.
 Real photos are cropped to a square around the cat's bounding box, so the cat stays inside the crop
 as in training. Generated images are used as they are (512x512).
 
-  .venv/bin/python tools/make_teaser.py --dataset ~/DiffusionLearn_data/pretrain_v1 \\
+  .venv/bin/python scripts/eval/make_teaser.py --dataset ~/DiffusionLearn_data/pretrain_v1 \\
       --real terra/IMG_1.jpg terra/IMG_2.jpg ... --gen runs/teaser/gen/080.png ... --out assets/teaser.jpg
 """
 import argparse

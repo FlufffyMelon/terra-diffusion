@@ -7,7 +7,7 @@ Analysis of the loss blow-up in ldm_v1: data, weights and attention on the saved
   attention: max logits and entropy (as a fraction of log N) on real latents at several t
   loss     : eps-MSE on the same batch
 
-Launch: .venv/bin/python tools/diag_ldm.py runs/ldm_v1 ~/DiffusionLearn_data/pretrain_v1
+Launch: .venv/bin/python scripts/eval/diag_ldm.py runs/ldm_v1 ~/DiffusionLearn_data/pretrain_v1
 """
 import json
 import math
@@ -16,12 +16,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from models import UNet
-from models.unet import AttnBlock
-from train import VPSDE
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # repository root: terra_diffusion imports without installing
+from terra_diffusion.diffusion import VPSDE
+from terra_diffusion.models import UNet
+from terra_diffusion.models.unet import AttnBlock
 
 run, data = Path(sys.argv[1]), Path(sys.argv[2])
 cfg = json.loads((run / "config.json").read_text())

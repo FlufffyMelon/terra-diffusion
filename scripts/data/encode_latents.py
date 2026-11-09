@@ -9,6 +9,7 @@ One job per GPU, the work is split into shards by --shard and --nshards. A finis
 """
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -17,7 +18,8 @@ import torch
 from diffusers import AutoencoderKL
 from torch.utils.data import DataLoader
 
-from dataset import FrameCrops, read_manifest
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # repository root: terra_diffusion imports without installing
+from terra_diffusion.data import FrameCrops, read_manifest
 
 
 def parse_args():

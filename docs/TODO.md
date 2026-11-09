@@ -49,7 +49,7 @@ DDP measurement on 7 GPUs: batch 32 gives 1.14 steps/s (255 frames/s), batch 64 
 because ~0.5 s goes to synchronizing 800 MB of gradients, so batch 64 is more efficient: in the same time 18% fewer steps but 1.6 times more frames.
 
 Outcome of `ldm_v1`: at step 5 400 the loss jumped from 0.176 to 0.27 and returned only around step 16 800, when LR dropped below ~6e-5.
-The cause, according to `tools/diag_ldm.py`: attention collapse. A single head over 384-768 channels without normalization of q and k, logits up to 18 000,
+The cause, according to `scripts/eval/diag_ldm.py`: attention collapse. A single head over 384-768 channels without normalization of q and k, logits up to 18 000,
 entropy 0.01 of log N at 16x16 already by step 5 000. EMA 5 000 and raw weights 23 000 give the same loss, i.e. 18k steps were wasted.
 Also, all DDP processes ran with the same seed, and t, noise and dropout were identical on all GPUs.
 
@@ -90,7 +90,7 @@ A single file `manifest.jsonl`, one line per frame: source, path, sizes, final b
 - [ ] Compute the VAE scale factor on the final set. On Terra photos it is 0.231, not the standard 0.18215.
 - [ ] Write the latent computation and cache. The crops are random, so either precompute a set of crops per frame or encode on the fly.
 - [ ] Model preset: `in_ch=4`, `base=128`, attention at 32, 16, 8.
-- [ ] Adapt `memorization.py`: decode the latents, compute KID and `ratio<0.7` in pixels.
+- [ ] Adapt `experiments/pixel64/memorization.py`: decode the latents, compute KID and `ratio<0.7` in pixels.
 - [ ] A metric for cut-off cats and poses: run a detector on the samples, the share of boxes at the edge and of elongated boxes. KID does not see this.
 
 ## 4. Pretraining at 512x512

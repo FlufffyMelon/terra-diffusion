@@ -10,11 +10,11 @@
 #SBATCH --output=runs/slurm_%j.log
 
 # Latent diffusion training on Lightning. One process per GPU, launched via srun, a single node.
-#   RUN=ldm_v1 DATA=~/DiffusionLearn_data/pretrain_v1 sbatch -w node211-17 train_ldm.sbatch
+#   RUN=ldm_v1 DATA=~/DiffusionLearn_data/pretrain_v1 sbatch slurm/train_ldm.sbatch
 # If it hits the time limit, launch it again with the same RUN: it continues from last.ckpt.
 
 PROJECTDIR="$SLURM_SUBMIT_DIR"   # submit from the project root
 cd "$PROJECTDIR"
 echo "=== LDM $(date) | job $SLURM_JOB_ID | node $(hostname) | run $RUN | GPU $SLURM_NTASKS_PER_NODE ==="
-srun .venv/bin/python train_ldm.py --data "$DATA" --out "runs/$RUN" --devices "$SLURM_NTASKS_PER_NODE" "$@"
+srun .venv/bin/python scripts/train_ldm.py --data "$DATA" --out "runs/$RUN" --devices "$SLURM_NTASKS_PER_NODE" "$@"
 echo "=== done $(date) ==="

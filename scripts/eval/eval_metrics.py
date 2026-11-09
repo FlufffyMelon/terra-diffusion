@@ -5,7 +5,7 @@ Latent diffusion quality: FD-DINOv2 and KID between samples and real frames.
   FD-DINOv2 : Frechet distance between Gaussians of DINOv2 ViT-L/14 features (CLS after LayerNorm, input 224),
               as in Stein et al. 2023. Sensitive to overall shift and spread, but biased at small N:
               compare only at the same number of samples.
-  KID       : unbiased estimate of MMD^2 with a polynomial kernel on Inception-v3 features (as in memorization.py),
+  KID       : unbiased estimate of MMD^2 with a polynomial kernel on Inception-v3 features (as in experiments/pixel64/memorization.py),
               works with a thousand samples too, gives the spread over subsets.
   For free  : FID on Inception and KID on DINOv2, the features are computed anyway.
 
@@ -15,13 +15,12 @@ Two anchor rows to understand the scale:
   reconstruction  : the same frames through the VAE. The best one can get with this VAE.
 
 Rows: a checkpoint or checkpoint|weak model|w (autoguidance), all via SDE with --steps steps.
-  .venv/bin/python tools/eval_metrics.py --dataset ~/DiffusionLearn_data/pretrain_v1 --out runs/eval/v2_v3 \\
+  .venv/bin/python scripts/eval/eval_metrics.py --dataset ~/DiffusionLearn_data/pretrain_v1 --out runs/eval/v2_v3 \\
       --rows runs/ldm_v3/ckpt/last.ckpt "runs/ldm_v3/ckpt/last.ckpt|runs/ldm_v2/ckpt/last.ckpt|2"
 In --out: metrics.csv (one row per variant, appended as they finish), feats/*.npz, grids/*.jpg.
 """
 import argparse
 import csv
-import json
 import sys
 import time
 from pathlib import Path
@@ -30,16 +29,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL
-from scipy import linalg
 from torch.utils.data import DataLoader, Subset
 from torchvision.utils import save_image
 from transformers import AutoModel
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from dataset import FrameCrops, read_manifest
-from memorization import inception_feats, kid, load_inception
-from models import UNet
-from train import VPSDE, sample
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # repository root: terra_diffusion imports without installing
+from terra_diffusion.checkpoints import load_unet
+from terra_diffusion.data import FrameCrops, read_manifest
+from terra_diffusion.diffusion import VPSDE, sample
+from terra_diffusion.guidance import Guided
+from terra_diffusion.metrics import fd, inception_feats, kid, load_inception
 
 DINO = "facebook/dinov2-large"
 
@@ -59,33 +58,6 @@ def parse_args():
     return p.parse_args()
 
 
-class Guided(torch.nn.Module):
-    """Autoguidance: out = bad + w (good - bad)."""
-
-    def __init__(self, good, bad, w):
-        super().__init__()
-        self.good, self.bad, self.w = good, bad, w
-
-    def forward(self, x, c):
-        g, b = self.good(x, c), self.bad(x, c)
-        return b + self.w * (g - b)
-
-
-def load_unet(path, dev):
-    """EMA weights from ckpt/last.ckpt or ema_*.pt; configuration from config.json of the same run."""
-    path = Path(path)
-    run = path.parent.parent if path.parent.name == "ckpt" else path.parent
-    cfg = json.loads((run / "config.json").read_text())
-    ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
-    sd = ck["ema"] if "ema" in ck else {k[4:]: v for k, v in ck["state_dict"].items() if k.startswith("ema.")}
-    m = UNet(img_size=64, in_ch=4, base=cfg["base"], mults=[int(v) for v in cfg["mults"].split(",")], num_res=cfg["num_res"],
-             attn_res=[int(v) for v in cfg["attn_res"].split(",")], dropout=cfg["dropout"], norm_groups=32,
-             head_ch=cfg.get("head_ch") or None, qk_norm=cfg.get("qk_norm", False), cond_sizes=cfg.get("cond_sizes", []))
-    m.load_state_dict(sd)   # a model with conditions drawn without y uses "empty" conditions, like a model without conditions
-    step = ck.get("step", ck.get("global_step"))
-    return m.to(dev).eval().requires_grad_(False), cfg, f"{run.name}-{step}"
-
-
 class Features:
     """DINOv2 and Inception for images (B, 3, S, S) in [-1, 1] on the GPU."""
 
@@ -101,18 +73,6 @@ class Features:
         b = F.interpolate(b, size=(224, 224), mode="bicubic", align_corners=False, antialias=True).clamp(0, 1)
         d = self.dino(pixel_values=(b - self.mean) / self.std).pooler_output.double().cpu()
         return d, inception_feats(self.inc, x)
-
-
-def fd(a, b):
-    """Frechet distance between Gaussians of two feature sets (N, d)."""
-    a, b = a.numpy(), b.numpy()
-    mu1, mu2 = a.mean(0), b.mean(0)
-    s1, s2 = np.cov(a, rowvar=False), np.cov(b, rowvar=False)
-    # tr sqrt(S1 S2) = tr sqrt(sqrt(S1) S2 sqrt(S1)): the second matrix is symmetric, its root via eigvalsh is stable
-    e, v = linalg.eigh(s1)
-    r1 = (v * np.sqrt(np.clip(e, 0, None))) @ v.T
-    tr_covmean = np.sqrt(np.clip(linalg.eigvalsh(r1 @ s2 @ r1), 0, None)).sum()
-    return float(((mu1 - mu2) ** 2).sum() + np.trace(s1) + np.trace(s2) - 2 * tr_covmean)
 
 
 def real_loader(rows, root, idx, a):

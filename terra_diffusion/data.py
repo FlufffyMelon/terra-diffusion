@@ -19,7 +19,7 @@ import torchvision.transforms.v2.functional as TF
 from PIL import Image, ImageOps
 from torch.utils.data import Dataset
 
-from train import crop_offsets, min_crop_side, to_unit
+from .images import crop_offsets, min_crop_side, to_unit
 
 
 def read_manifest(path, flag="fit_1x1"):

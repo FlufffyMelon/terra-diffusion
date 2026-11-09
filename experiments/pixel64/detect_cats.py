@@ -13,11 +13,12 @@ The folder <data-dir>_labeled receives:
 
 Example:
   sbatch -p AMD7V12-RTX4500-CCP --gpus=1 -c 8 --mem=32G -t 00:30:00 -o runs/detect_%j.log \
-      --wrap ".venv/bin/python detect_cats.py --data-dir dataset_unique"
+      --wrap ".venv/bin/python experiments/pixel64/detect_cats.py --data-dir dataset_unique"
 """
 import argparse
 import json
 import time
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +27,8 @@ import torchvision.transforms.v2.functional as TF
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from torchvision.models.detection import FasterRCNN_ResNet50_FPN_V2_Weights, fasterrcnn_resnet50_fpn_v2
 
-from train import IMG_EXT
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # repository root: terra_diffusion imports without installing
+from terra_diffusion.images import IMG_EXT
 
 GREEN, RED = (0, 230, 0), (255, 0, 0)
 PALETTE = [(255, 220, 0), (0, 200, 255), (255, 90, 200), (255, 140, 0), (120, 255, 120), (200, 160, 255)]

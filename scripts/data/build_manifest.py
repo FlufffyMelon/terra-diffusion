@@ -33,7 +33,7 @@ LICENSES = {"oi": "CC BY 2.0", "cati": "CC BY 4.0", "popcats": "not specified"}
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--root", type=str, default=str(Path.home() / "DiffusionLearn_data"))
-    p.add_argument("--project", type=str, default=str(Path(__file__).resolve().parent))
+    p.add_argument("--project", type=str, default=str(Path(__file__).resolve().parents[2]), help="repository root")
     p.add_argument("--name", type=str, default="pretrain_v1")
     p.add_argument("--score", type=float, default=0.5)
     p.add_argument("--iou", type=float, default=0.7)
@@ -148,7 +148,7 @@ def frames(a, root, source, folder, drop):
 
 
 def terra_frames(a):
-    boxes = json.loads((Path(a.project) / "dataset_unique_labeled/boxes.json").read_text())
+    boxes = json.loads((Path(a.project) / "data/terra_boxes.json").read_text())
     src = Path(a.project) / "dataset_unique"
     for n, r in sorted(boxes.items()):
         W, H, b = r["width"], r["height"], r["box"]

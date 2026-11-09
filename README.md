@@ -113,7 +113,7 @@ flowchart LR
 | Diffusion | VP-SDE with a linear β schedule, **v-prediction** |
 | Conditions (`ldm_v4`) | learned embeddings for *who* and *type*, added to the noise embedding, zero-initialised |
 | Training | Adam, linear warm-up and cosine decay, EMA 0.9999, bf16, gradient clipping 1, DDP via Lightning |
-| Sampling | Euler–Maruyama SDE (250 steps) or Heun ODE (50 steps); CFG and autoguidance wrappers in `guidance.py` |
+| Sampling | Euler–Maruyama SDE (250 steps) or Heun ODE (50 steps); CFG and autoguidance wrappers in `terra_diffusion/guidance.py` |
 
 | Run | Starts from | Steps | GPUs | What changed |
 |---|---|---:|---:|---|
@@ -149,8 +149,9 @@ huggingface-cli download facebook/dinov2-large
 huggingface-cli download openai/clip-vit-large-patch14
 ```
 
-The project was developed on a Slurm cluster. The `*.sbatch` files and the paths at the top of the notebooks
-(`RUN_DIR`, `DATA`) point to that cluster: change them to your own paths and partition.
+The project was developed on a Slurm cluster. The files in `slurm/` name that cluster's partition: change it to yours,
+and submit them from the repository root. Notebooks find the repository root by themselves and use paths relative to it
+(`runs/...`) and `~/DiffusionLearn_data/` for data.
 
 ## Usage
 
@@ -159,19 +160,19 @@ Data lives outside the repository, by default in `~/DiffusionLearn_data/` (`--ro
 **1. Download and detect**
 
 ```bash
-python download_cats.py oi --workers 32        # Open Images V7
-python download_cats.py inat --workers 64      # iNaturalist; resumes, respects rate limits
+python scripts/data/download_cats.py oi --workers 32     # Open Images V7
+python scripts/data/download_cats.py inat --workers 64   # iNaturalist; resumes, respects rate limits
 # Kaggle "pop-cats" and "Cat Individuals" are unpacked by hand into <root>/probe/popcats and <root>/probe/cati
-python detect_bulk.py --model yolo26x          # one job per detector, both are needed
-python detect_bulk.py --model rtdetr-x
+python scripts/data/detect_bulk.py --model yolo26x      # one job per detector, both are needed
+python scripts/data/detect_bulk.py --model rtdetr-x
 ```
 
 **2. Build and clean the dataset**
 
 ```bash
-python build_manifest.py --name pretrain_v1
-python filter_frames.py --dataset ~/DiffusionLearn_data/pretrain_v1 --dry-run   # review sheets first
-python filter_frames.py --dataset ~/DiffusionLearn_data/pretrain_v1
+python scripts/data/build_manifest.py --name pretrain_v1
+python scripts/data/filter_frames.py --dataset ~/DiffusionLearn_data/pretrain_v1 --dry-run   # review sheets first
+python scripts/data/filter_frames.py --dataset ~/DiffusionLearn_data/pretrain_v1
 ```
 
 `--dry-run` writes sheets of rejected frames per reason to `review/`. `--reuse` reuses the stored CLIP embeddings,
@@ -180,16 +181,16 @@ so thresholds and even the text prompts can be changed without recomputing image
 **3. Encode latents** (one shard per GPU)
 
 ```bash
-sbatch --array=0-7 encode_latents.sbatch ~/DiffusionLearn_data/pretrain_v1 --crops 8 --frames 3
+sbatch --array=0-7 slurm/encode_latents.sbatch ~/DiffusionLearn_data/pretrain_v1 --crops 8 --frames 3
 ```
 
 **4. Pretrain**
 
 ```bash
 RUN=ldm_v2 DATA=~/DiffusionLearn_data/pretrain_v1 sbatch --ntasks-per-node=8 --gpus-per-node=8 \
-    train_ldm.sbatch --batch 64 --steps 26000
+    slurm/train_ldm.sbatch --batch 64 --steps 26000
 RUN=ldm_v3 DATA=~/DiffusionLearn_data/pretrain_v1 sbatch --ntasks-per-node=8 --gpus-per-node=8 \
-    train_ldm.sbatch --batch 64 --steps 43000 --warmup 1000 --init runs/ldm_v2/ckpt/last.ckpt
+    slurm/train_ldm.sbatch --batch 64 --steps 43000 --warmup 1000 --init runs/ldm_v2/ckpt/last.ckpt
 ```
 
 A run resumes from `runs/<RUN>/ckpt/last.ckpt` when started again. It logs `metrics.csv` (loss per noise level,
@@ -199,50 +200,57 @@ sample grids, EMA snapshots and raw weights.
 **5. Teach the model Terra**
 
 ```bash
-python tools/prepare_cond.py --dataset ~/DiffusionLearn_data/pretrain_v1     # held-out Terra photos, DINOv2 clusters
-python encode_latents.py --dataset ~/DiffusionLearn_data/pretrain_v1 --source terra \
-    --out-dir latents_terra --crops 64 --frames 1                            # more crops of Terra
+python scripts/data/prepare_cond.py --dataset ~/DiffusionLearn_data/pretrain_v1   # held-out Terra photos, DINOv2 clusters
+python scripts/data/encode_latents.py --dataset ~/DiffusionLearn_data/pretrain_v1 --source terra \
+    --out-dir latents_terra --crops 64 --frames 1                                    # more crops of Terra
 RUN=ldm_v4 DATA=~/DiffusionLearn_data/pretrain_v1 sbatch --ntasks-per-node=8 --gpus-per-node=8 \
-    train_ldm.sbatch --batch 64 --steps 25000 --lr 5e-5 --warmup 1000 --cond --terra-frac 0.1 \
+    slurm/train_ldm.sbatch --batch 64 --steps 25000 --lr 5e-5 --warmup 1000 --cond --terra-frac 0.1 \
     --snapshot-every 2500 --init runs/ldm_v3/ckpt/last.ckpt
 ```
 
 **6. Evaluate**
 
 ```bash
-python tools/eval_metrics.py --dataset ~/DiffusionLearn_data/pretrain_v1 --out runs/eval/general \
+python scripts/eval/eval_metrics.py --dataset ~/DiffusionLearn_data/pretrain_v1 --out runs/eval/general \
     --rows runs/ldm_v3/ckpt/last.ckpt "runs/ldm_v3/ckpt/last.ckpt|runs/ldm_v2/ckpt/last.ckpt|2"
-python tools/eval_terra.py --ckpt runs/ldm_v4/ema_0007500.pt --dataset ~/DiffusionLearn_data/pretrain_v1 \
+python scripts/eval/eval_terra.py --ckpt runs/ldm_v4/ema_0007500.pt --dataset ~/DiffusionLearn_data/pretrain_v1 \
     --out runs/eval/terra --rows "w=2,type=terra" "w=3,type=terra" w=2
-python tools/compare_samplers.py runs/ldm_v3       # one sheet of samplers and guidance settings
+python scripts/eval/compare_samplers.py runs/ldm_v3   # one sheet of samplers and guidance settings
 ```
 
 **7. Generate**
 
-Open [`terra.ipynb`](terra.ipynb): choose a checkpoint, *who* (`'terra'`, `'other'` or `None`), *type*
+Open [`notebooks/terra.ipynb`](notebooks/terra.ipynb): choose a checkpoint, *who* (`'terra'`, `'other'` or `None`), *type*
 (a cluster id or Terra's own), CFG strength, SDE or ODE, and optional autoguidance. It saves the images,
 compares guidance strengths and samplers, and shows the closest training photo next to every result.
-[`pretrain.ipynb`](pretrain.ipynb) shows training curves, sample grids over training and the denoising trajectory
+[`notebooks/pretrain.ipynb`](notebooks/pretrain.ipynb) shows training curves, sample grids over training and the denoising trajectory
 in latent and pixel space, and saves it as a video.
 
 ## Repository layout
 
-| Path | What it does |
-|---|---|
-| `download_cats.py`, `detect_bulk.py` | download cat photos, run the detectors |
-| `build_manifest.py`, `filter_frames.py` | assemble the dataset, filter it with CLIP and simple image checks |
-| `encode_latents.py`, `dataset.py` | VAE latents; datasets for training (`CatLatents`, `CondLatents`) |
-| `train_ldm.py`, `*.sbatch` | latent diffusion training with Lightning (multi-GPU) |
-| `models/unet.py` | U-Net with multi-head QK-normalised attention and optional conditions |
-| `train.py` | VP-SDE, loss, samplers; also the earlier 64×64 pixel-space trainer |
-| `guidance.py` | classifier-free guidance and autoguidance wrappers |
-| `tools/prepare_cond.py` | held-out Terra photos and DINOv2 clusters for the conditions |
-| `tools/eval_metrics.py`, `tools/eval_terra.py` | FD-DINOv2, KID, FID; Terra identity, copies and diversity |
-| `tools/compare_samplers.py`, `tools/diag_ldm.py` | sampler and guidance comparison; attention diagnostics |
-| `memorization.py`, `diagnose.py`, `detect_cats.py` | tools from the 64×64 pixel-space experiments that came first |
-| `pretrain.ipynb`, `terra.ipynb` | training monitor and trajectories; generation of Terra |
-| `monitor.ipynb`, `vae.ipynb`, `Moons.ipynb` | 64×64 training monitor, VAE study, a toy 2D diffusion |
-| `docs/` | working plan and a survey of cat datasets |
+```
+terra_diffusion/          the library
+  models/unet.py            U-Net with multi-head QK-normalised attention and optional class conditions
+  diffusion.py              VP-SDE, training loss, samplers (Euler, Heun, Euler-Maruyama)
+  data.py                   datasets of frames and precomputed latents (FrameCrops, CatLatents, CondLatents)
+  guidance.py               classifier-free guidance and autoguidance wrappers
+  images.py                 photo loading, the crop rule that keeps the whole cat inside, image grids
+  metrics.py                KID, Frechet distance, copy detection
+  checkpoints.py            loading trained models from a run folder
+scripts/
+  data/                     download_cats, detect_bulk, build_manifest, filter_frames, encode_latents, prepare_cond
+  train_ldm.py              latent diffusion training with Lightning, multi-GPU
+  eval/                     eval_metrics, eval_terra, compare_samplers, diag_ldm, make_teaser
+slurm/                    Slurm jobs for training and encoding
+notebooks/                pretrain (training monitor, denoising trajectories), terra (generation), vae (VAE study)
+experiments/
+  pixel64/                  the 64x64 pixel-space experiments that came first: trainer, memorisation test, monitor
+  Moons.ipynb               a toy 2D diffusion
+data/terra_boxes.json     hand-checked bounding boxes of Terra on her photos
+docs/                     working plan and a survey of cat datasets
+tools/                    repository helpers: notebook output stripping for git, a wait-for-data gate
+assets/                   images for this README
+```
 
 ## What we learned
 

@@ -2,7 +2,7 @@
 """
 Latent diffusion on Lightning, several GPUs of one node. The model, noise schedule and sampler are from train.py.
 
-Launch: train_ldm.sbatch. Launching with the same --out resumes from last.ckpt.
+Launch: slurm/train_ldm.sbatch from the repository root. Launching with the same --out resumes from last.ckpt.
 In --out: metrics.csv (eps-MSE as in train.py, comparable between runs, gradient norm before clipping, worst attention),
 attn.csv (max logits and entropy of each attention block), samples/, ckpt/last.ckpt, ema_*.pt,
 raw/raw_*.pt (raw weights in bf16, for analyzing training blow-ups).
@@ -13,8 +13,8 @@ import csv
 import json
 import math
 import platform
+import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
 import lightning as L
@@ -24,11 +24,13 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.strategies import DDPStrategy
 from torch.utils.data import DataLoader
 
-from dataset import CatLatents, CondLatents
-from guidance import CFG
-from models import UNet
-from models.unet import AttnBlock
-from train import VPSDE, cosine_lr, diffusion_loss, ema_update, sample, save_grid
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # repository root: terra_diffusion imports without installing
+from terra_diffusion.data import CatLatents, CondLatents
+from terra_diffusion.diffusion import VPSDE, cosine_lr, diffusion_loss, ema_update, sample
+from terra_diffusion.guidance import CFG
+from terra_diffusion.images import save_grid
+from terra_diffusion.models import UNet
+from terra_diffusion.models.unet import AttnBlock
 
 
 def parse_args():

@@ -5,7 +5,7 @@ Comparison of samplers and autoguidance on the same starting noises. Row = varia
 Autoguidance (Karras et al. 2024): the output of the good model is pushed away from the output of the weak one,
   out = bad + w (good - bad),  w = 1 without guidance. Weak model: an early EMA snapshot of the same run.
 
-Launch: .venv/bin/python tools/compare_samplers.py runs/ldm_v2 [--n 8] [--seed 0]
+Launch: .venv/bin/python scripts/eval/compare_samplers.py runs/ldm_v2 [--n 8] [--seed 0]
 Result: <run>/compare/samplers_seed<seed>.png and one image per variant.
 
 Custom rows instead of the standard set, all via SDE with --steps steps:
@@ -16,7 +16,6 @@ import argparse
 import json
 import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -25,9 +24,9 @@ from diffusers import AutoencoderKL
 from matplotlib import font_manager
 from PIL import Image, ImageDraw, ImageFont
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from models import UNet
-from train import VPSDE, sample
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # repository root: terra_diffusion imports without installing
+from terra_diffusion.diffusion import VPSDE, sample
+from terra_diffusion.models import UNet
 
 
 class Guided(nn.Module):

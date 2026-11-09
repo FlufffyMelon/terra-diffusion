@@ -25,22 +25,22 @@ are taken the same way as during training, i.e. the cat box is always inside the
 
 Example:
   sbatch -p AMD7V12-RTX4500-CCP --gpus=1 -c 8 --mem=48G -t 02:00:00 -o runs/memorization_%j.log \
-      --wrap ".venv/bin/python memorization.py --runs runs/cat64_eps runs/cat64_uniq \
-              --data-dirs Terra dataset_unique --exclude-files exclude_eps.txt -"
+      --wrap ".venv/bin/python experiments/pixel64/memorization.py --runs runs/cat64_eps runs/cat64_uniq \
+              --data-dirs Terra dataset_unique --exclude-files experiments/pixel64/exclude_eps.txt -"
 """
 import argparse
 import csv
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-from models import model_from_checkpoint
-import torchvision.transforms.v2.functional as TF
-from train import (CatDataset, center_crops, crop_offsets, load_boxes, load_images, min_crop_side, sample, save_grid,
-                   sde_from_cfg, to_unit)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # repository root: terra_diffusion imports without installing
+from terra_diffusion.metrics import build_refs, inception_feats, kid, load_inception, nearest
+from terra_diffusion.models import model_from_checkpoint
+from train import CatDataset, center_crops, load_boxes, load_images, sample, save_grid, sde_from_cfg
 
 
 def parse_args():
@@ -65,49 +65,6 @@ def parse_args():
 
 
 # ----------------------------------------------------------------------------- KID
-def load_inception(dev):
-    """Inception-v3 from torchvision, without the last layer: outputs 2048 features per image.
-    The weights are downloaded on the first call into ~/.cache/torch; on nodes without internet download them beforehand."""
-    import torchvision
-    net = torchvision.models.inception_v3(weights="IMAGENET1K_V1")
-    net.fc = torch.nn.Identity()
-    return net.to(dev).eval()
-
-
-@torch.no_grad()
-def inception_feats(net, x, batch=64):
-    """x : (N, 3, S, S) in [-1, 1]  ->  (N, 2048) features in float64 on CPU."""
-    mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
-    out = []
-    for i in range(0, len(x), batch):
-        b = (x[i:i + batch].float().clamp(-1, 1) + 1) / 2
-        b = F.interpolate(b, size=(299, 299), mode="bilinear", align_corners=False, antialias=True)
-        out.append(net((b - mean) / std).double().cpu())
-    return torch.cat(out)
-
-
-def kid(f_real, f_gen, n_subsets=100, seed=0):
-    """
-    Kernel Inception Distance: unbiased estimate of MMD^2 with kernel k(a, b) = (a.b / d + 1)^3
-    between features of real photos and samples. 0 = distributions match, lower = better.
-    Computed over random subsets of equal size, returns the mean and the spread.
-    """
-    g = torch.Generator().manual_seed(seed)
-    d = f_real.shape[1]
-    m = min(len(f_real), len(f_gen))
-    vals = []
-    for _ in range(n_subsets):
-        a = f_real[torch.randperm(len(f_real), generator=g)[:m]]
-        b = f_gen[torch.randperm(len(f_gen), generator=g)[:m]]
-        kaa = (a @ a.T / d + 1) ** 3
-        kbb = (b @ b.T / d + 1) ** 3
-        kab = (a @ b.T / d + 1) ** 3
-        vals.append(((kaa.sum() - kaa.diagonal().sum()) / (m * (m - 1))
-                     + (kbb.sum() - kbb.diagonal().sum()) / (m * (m - 1))
-                     - 2 * kab.mean()).item())
-    vals = np.array(vals)
-    return vals.mean(), vals.std()
 
 
 def read_exclude(path):
@@ -118,59 +75,6 @@ def read_exclude(path):
             if line:
                 ex.add(line)
     return ex
-
-
-def build_refs(imgs, size, scales, npos, boxes=None, nsides=5):
-    """
-    All crop variants of each photo: scales x shifts x flip. Returns (M, 3, S, S) and the photo index.
-    With boxes, instead of scales, nsides sides from the smallest allowed up to the short side of the photo, the box is always inside.
-    """
-    crops, owner = [], []
-    for k, img in enumerate(imgs):
-        _, H, W = img.shape
-        short = min(H, W)
-        if boxes is None:
-            sides = [int(short * s) for s in scales]
-        else:
-            sides = sorted(set(np.linspace(min_crop_side(boxes[k], H, W, size), short, nsides).round().astype(int).tolist()))
-        for side in sides:
-            top_min, top_max, left_min, left_max = (0, H - side, 0, W - side) if boxes is None else crop_offsets(boxes[k], H, W, side)
-            ys = sorted(set(np.linspace(top_min, top_max, npos).round().astype(int).tolist()))
-            xs = sorted(set(np.linspace(left_min, left_max, npos).round().astype(int).tolist()))
-            b = torch.stack([img[:, y:y + side, x:x + side] for y in ys for x in xs])        # uint8
-            b = to_unit(TF.resize(b, [size, size], antialias=True))                          # as in training
-            b = torch.cat([b, b.flip(-1)])
-            crops.append(b)
-            owner += [k] * len(b)
-    return torch.cat(crops), torch.tensor(owner, dtype=torch.long)
-
-
-@torch.no_grad()
-def nearest(q, refs, owner, n_img, exclude_self=None, chunk=4096):
-    """
-    q    : (n, D) queries, refs : (M, D) crops, owner : (M,) photo index of each crop.
-    Returns d1, d2 (to the two nearest DIFFERENT photos), the index of the nearest photo and the index of the best crop.
-    exclude_self : (n,) index of the photo that must not count as a neighbor (for calibration on the photos themselves).
-    """
-    n = q.shape[0]
-    qn = (q * q).sum(1, keepdim=True)
-    per_img = torch.full((n, n_img), float("inf"), device=q.device)
-    best = torch.full((n,), float("inf"), device=q.device)
-    best_idx = torch.zeros(n, dtype=torch.long, device=q.device)
-    for s in range(0, refs.shape[0], chunk):
-        r = refs[s:s + chunk]
-        o = owner[s:s + chunk]
-        dd = (qn + (r * r).sum(1)[None, :] - 2.0 * (q @ r.T)).clamp_min(0)   # squared distances
-        if exclude_self is not None:
-            dd = dd.masked_fill(exclude_self[:, None] == o[None, :], float("inf"))
-        per_img.scatter_reduce_(1, o[None, :].expand(n, -1), dd, reduce="amin")
-        m, a = dd.min(1)
-        upd = m < best
-        best[upd] = m[upd]
-        best_idx[upd] = a[upd] + s
-    top = per_img.topk(2, dim=1, largest=False)
-    d1, d2 = top.values.sqrt().T
-    return d1, d2, top.indices[:, 0], best_idx
 
 
 def main():

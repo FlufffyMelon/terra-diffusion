@@ -29,8 +29,8 @@ from matplotlib import font_manager
 from torch.utils.data import DataLoader
 from transformers import AutoModel
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from dataset import FrameCrops, read_manifest
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # repository root: terra_diffusion imports without installing
+from terra_diffusion.data import FrameCrops, read_manifest
 
 DINO = "facebook/dinov2-large"
 

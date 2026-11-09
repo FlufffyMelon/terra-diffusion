@@ -9,17 +9,19 @@ Diagnostics of a trained model without interfering with training.
                   Each row = one sampler (the order is printed to the console).
 
 Example:
-  srun --jobid=139160 --overlap -n 1 -c 2 .venv/bin/python diagnose.py \
-      --run runs/cat64_fast --data-dir Terra --exclude-file exclude.txt
+  srun --jobid=139160 --overlap -n 1 -c 2 .venv/bin/python experiments/pixel64/diagnose.py \
+      --run runs/cat64_fast --data-dir Terra --exclude-file experiments/pixel64/exclude.txt
 """
 import argparse
 import time
 from contextlib import nullcontext
+import sys
 from pathlib import Path
 
 import torch
 
-from models import model_from_checkpoint
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # repository root: terra_diffusion imports without installing
+from terra_diffusion.models import model_from_checkpoint
 from train import sde_from_cfg, center_crops, load_images, sample, save_grid
 
 

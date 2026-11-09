@@ -10,8 +10,8 @@
 #SBATCH --output=runs/slurm_%j.log
 
 # Training a diffusion model on cat photos (64x64, VP-SDE, U-Net).
-# Launch:              sbatch train.sbatch
-# Another name and model:  RUN=cat64_small sbatch train_ada.sbatch --model unet_small
+# Launch:              sbatch experiments/pixel64/train.sbatch   (from the repository root)
+# Another name and model:  RUN=cat64_small sbatch experiments/pixel64/train_ada.sbatch --model unet_small
 # Any arguments after the script name go to train.py.
 # If it hits the time limit, just launch it again with the same RUN: it continues from last.pt.
 
@@ -26,7 +26,7 @@ export OMP_NUM_THREADS=1   # parallelize data loading with DataLoader workers, n
 
 echo "=== DDPM cat $(date) | job $SLURM_JOB_ID | node $(hostname) | run $RUN ==="
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
-python "${PROJECTDIR}/train.py" \
+python "${PROJECTDIR}/experiments/pixel64/train.py" \
     --data-dir "${PROJECTDIR}/dataset_unique" \
     --out-dir "$OUTDIR" \
     --workers $(( ${SLURM_CPUS_PER_TASK:-16} - 2 )) \

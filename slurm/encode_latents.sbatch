@@ -10,9 +10,9 @@
 #SBATCH --output=runs/encode_%A_%a.log
 
 # Latents in shards, one shard per GPU:
-#   sbatch --array=0-2 encode_latents.sbatch ~/DiffusionLearn_data/pretrain_v1
+#   sbatch --array=0-2 slurm/encode_latents.sbatch ~/DiffusionLearn_data/pretrain_v1
 # Arguments after the dataset path go to encode_latents.py.
 
 DATASET=$1; shift
 cd "$SLURM_SUBMIT_DIR"   # submit from the project root
-.venv/bin/python encode_latents.py --dataset "$DATASET" --shard "$SLURM_ARRAY_TASK_ID" --nshards "$SLURM_ARRAY_TASK_COUNT" "$@"
+.venv/bin/python scripts/data/encode_latents.py --dataset "$DATASET" --shard "$SLURM_ARRAY_TASK_ID" --nshards "$SLURM_ARRAY_TASK_COUNT" "$@"

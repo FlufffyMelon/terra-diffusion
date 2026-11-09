@@ -8,8 +8,8 @@ Downloads cat photos for pretraining. The run can be interrupted and repeated: f
          In <root>/inat: images/ and photos.jsonl (license and author of each photo, they must be kept).
 
 Run on the login node, in tmux:
-  .venv/bin/python download_cats.py oi --workers 32
-  .venv/bin/python download_cats.py inat --workers 64
+  .venv/bin/python scripts/data/download_cats.py oi --workers 32
+  .venv/bin/python scripts/data/download_cats.py inat --workers 64
 """
 import argparse
 import io
