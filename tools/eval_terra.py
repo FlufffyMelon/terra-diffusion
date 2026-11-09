@@ -5,9 +5,12 @@
   похожесть  : логистическая регрессия «Терра / другая кошка» на обучающих кадрах Терры и случайных других кошках.
                Ее точность на отложенных кадрах terra_holdout.json печатается как проверка. Метрика: доля сэмплов,
                которые она считает Террой (p > 0.5).
-  новизна    : косинусная близость каждого сэмпла к ближайшему обучающему кадру Терры. Порог «почти копия» это
-               95-й перцентиль той же величины у отложенных кадров: настоящее новое фото Терры похоже на обучающие
-               не сильнее. Метрика: доля сэмплов выше порога (у настоящих новых фото около 5%).
+  копии      : как в memorization.py, но для 512 px. Каждое обучающее фото Терры раскладывается на кропы по правилу
+               обучения (бокс внутри, несколько размеров и сдвигов, отражение) в 64x64. Для сэмпла d1 = расстояние
+               до ближайшего фото, d2 = до второго ближайшего другого фото, ratio = d1 / d2. Копия близка к одному фото
+               намного сильнее, чем к остальным: ratio < 0.7. Калибровка: то же у отложенных настоящих фото.
+               Близость DINOv2 к ближайшему фото тоже печатается, но копии она не ловит: все фото Терры для нее
+               и так похожи (медиана 0.93), а явная копия может иметь 0.93.
   разнообразие и реализм : KID и FD между сэмплами и всеми кадрами Терры, признаки DINOv2. FD при малом N смещен,
                сравнивать только варианты с одинаковым N.
 
@@ -21,6 +24,7 @@
 import argparse
 import csv
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -28,17 +32,19 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.v2.functional as TF
 from diffusers import AutoencoderKL
+from PIL import Image, ImageOps
 from torchvision.utils import save_image
 from transformers import AutoModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dataset import FrameCrops, read_manifest
 from guidance import CFG, Guided
-from memorization import kid
+from memorization import build_refs, kid, nearest
 from models import UNet
 from tools.eval_metrics import fd
-from train import VPSDE, sample
+from train import VPSDE, crop_offsets, min_crop_side, sample, to_unit
 
 DINO = "facebook/dinov2-large"
 
@@ -67,6 +73,47 @@ def load_unet(path, dev):
              head_ch=cfg.get("head_ch") or None, qk_norm=cfg.get("qk_norm", False), cond_sizes=cfg.get("cond_sizes", []))
     m.load_state_dict(sd)
     return m.to(dev).eval().requires_grad_(False), cfg, f"{run.name}-{ck.get('step', ck.get('global_step'))}"
+
+
+def load_photos(root, rows, short=256):
+    """Фото с уменьшенной короткой стороной и бокс кошки в пикселях: (3, H, W) uint8 и (x1, y1, x2, y2)."""
+    imgs, boxes = [], []
+    for r in rows:
+        im = ImageOps.exif_transpose(Image.open(root / r["path"])).convert("RGB")
+        k = short / min(im.size)
+        t = TF.pil_to_tensor(im.resize((round(im.size[0] * k), round(im.size[1] * k)), Image.BICUBIC))
+        _, H, W = t.shape
+        b = r["box"]
+        imgs.append(t)
+        boxes.append((max(math.floor(b[0] * W), 0), max(math.floor(b[1] * H), 0), min(math.ceil(b[2] * W), W), min(math.ceil(b[3] * H), H)))
+    return imgs, boxes
+
+
+def copy_refs(root, train_rows, size=64, npos=5, nsides=5):
+    """Кропы обучающих фото Терры по правилу обучения: (M, 3*size*size) на GPU и номер фото у каждого кропа."""
+    imgs, boxes = load_photos(root, train_rows)
+    refs, owner = build_refs(imgs, size, None, npos, boxes=boxes, nsides=nsides)
+    return refs.flatten(1).cuda(), owner.cuda()
+
+
+def random_crops(root, rows, size=64, seed=0):
+    """По одному случайному кропу на фото по правилу обучения, в [-1, 1]: калибровка на отложенных фото."""
+    g = torch.Generator().manual_seed(seed)
+    out = []
+    for img, box in zip(*load_photos(root, rows)):
+        _, H, W = img.shape
+        side = torch.randint(min_crop_side(box, H, W, size), min(H, W) + 1, (1,), generator=g).item()
+        t0, t1, l0, l1 = crop_offsets(box, H, W, side)
+        y, x = torch.randint(t0, t1 + 1, (1,), generator=g).item(), torch.randint(l0, l1 + 1, (1,), generator=g).item()
+        out.append(to_unit(TF.resize(img[:, y:y + side, x:x + side][None], [size, size], antialias=True))[0])
+    return torch.stack(out)
+
+
+def copy_ratio(img, refs, owner, n_img, size=64):
+    """img : (B, 3, S, S) в [-1, 1] -> ratio = d1 / d2 и номер ближайшего фото."""
+    q = F.interpolate(img.float(), size=(size, size), mode="bilinear", align_corners=False, antialias=True)
+    d1, d2, nn_img, _ = nearest(q.flatten(1).cuda(), refs, owner, n_img)
+    return d1 / d2, nn_img
 
 
 def logreg(x, y, iters=500, wd=1e-4):
@@ -111,9 +158,15 @@ def main():
     print(f"классификатор: отложенная Терра узнана {(clf(ho_terra) > 0.5).float().mean():.0%}, "
           f"другие кошки приняты за Терру {(clf(ho_other) > 0.5).float().mean():.1%}", flush=True)
     nn_hold = (ho_terra @ tr_terra.T).max(1).values
-    thr = torch.quantile(nn_hold, 0.95).item()
-    print(f"новизна: у отложенных кадров близость к ближайшему обучающему, медиана {nn_hold.median():.3f}, 95% {thr:.3f}", flush=True)
     all_terra = color[is_terra].double().cpu()
+
+    # копии: кропы обучающих фото Терры в пикселях, калибровка на отложенных
+    train_rows = [rows[p] for p in sorted(rows) if rows[p]["source"] == "terra" and p not in hold]
+    hold_rows = [rows[p] for p in sorted(hold)]
+    refs, owner = copy_refs(root, train_rows)
+    r_hold, _ = copy_ratio(random_crops(root, hold_rows), refs, owner, len(train_rows))
+    print(f"копии: {len(refs)} кропов {len(train_rows)} обучающих фото; у отложенных ratio < 0.7: {(r_hold < 0.7).float().mean():.1%}, "
+          f"медиана ratio {r_hold.median():.3f}", flush=True)
 
     def dino_feats(img):
         """Картинки (B, 3, S, S) в [-1, 1] -> нормированные признаки DINOv2, тем же путем, что у сэмплов."""
@@ -143,16 +196,17 @@ def main():
     f = open(out / "metrics.csv", "a", newline="")
     wr = csv.writer(f)
     if f.tell() == 0:
-        wr.writerow(["модель", "вариант", "n", "похожа_на_терру", "почти_копии", "близость_медиана", "kid_dinov2_x1000", "fd_dinov2", "секунд"])
+        wr.writerow(["модель", "вариант", "n", "похожа_на_терру", "копии_ratio<0.7", "ratio_медиана", "близость_dinov2_медиана",
+                     "kid_dinov2_x1000", "fd_dinov2", "секунд"])
     wr.writerow(["", "отложенные кадры Терры", len(ho_terra), f"{(clf(ho_terra) > 0.5).float().mean():.3f}",
-                 f"{(nn_hold > thr).float().mean():.3f}", f"{nn_hold.median():.3f}", "", "", ""])
+                 f"{(r_hold < 0.7).float().mean():.3f}", f"{r_hold.median():.3f}", f"{nn_hold.median():.3f}", "", "", ""])
     f.flush()
 
     for spec in a.rows:
         opt = dict(kv.split("=", 1) for kv in spec.split(","))
         w = float(opt.get("w", 1))
         t0 = time.time()
-        feats = []
+        feats, ratios = [], []
         for b in range(0, a.n, a.batch):
             n = min(a.batch, a.n - b)
             s = a.seed * 1_000_003 + b
@@ -174,15 +228,17 @@ def main():
                 if b == 0:
                     save_image((img[:32] + 1) / 2, out / "grids" / f"{name}_{spec.replace(',', '_').replace('/', '-')}.jpg", nrow=8)
                 feats.append(dino_feats(img))
-        e = torch.cat(feats)
+                ratios.append(copy_ratio(img, refs, owner, len(train_rows))[0])
+        e, rr = torch.cat(feats), torch.cat(ratios)
         nn_gen = (e @ tr_terra.T).max(1).values
         kd, _ = kid(all_terra, e.double().cpu())
-        r = [name, spec, len(e), f"{(clf(e) > 0.5).float().mean():.3f}", f"{(nn_gen > thr).float().mean():.3f}",
+        np.savez(out / f"{name}_{spec.replace(',', '_').replace('/', '-')}.npz", dino=e.cpu().numpy(), ratio=rr.cpu().numpy())
+        r = [name, spec, len(e), f"{(clf(e) > 0.5).float().mean():.3f}", f"{(rr < 0.7).float().mean():.3f}", f"{rr.median():.3f}",
              f"{nn_gen.median():.3f}", f"{kd * 1e3:.2f}", f"{fd(all_terra, e.double().cpu()):.1f}", f"{time.time() - t0:.0f}"]
         wr.writerow(r)
         f.flush()
-        print(f"{name} {spec}: похожа на Терру {r[3]}, почти копии {r[4]}, близость {r[5]}, KID-DINOv2 x1000 {r[6]}, FD {r[7]}, {r[8]} с",
-              flush=True)
+        print(f"{name} {spec}: похожа на Терру {r[3]}, копии {r[4]} (ratio {r[5]}), близость DINOv2 {r[6]}, KID-DINOv2 x1000 {r[7]}, "
+              f"FD {r[8]}, {r[9]} с", flush=True)
 
 
 if __name__ == "__main__":
